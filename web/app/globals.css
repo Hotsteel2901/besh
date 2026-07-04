@@ -2,12 +2,70 @@
 @tailwind components;
 @tailwind utilities;
 
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Orbitron:wght@700;900&display=swap');
+
+:root {
+  --neon-purple: #7C3AED;
+  --accent-rose: #F43F5E;
+  --void-bg: #0F0F23;
+  --terminal-green: #00FF41;
+  --dark-panel: #1A1030;
 }
 
-html {
-  scroll-behavior: smooth;
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--neon-purple) var(--void-bg);
+}
+
+body {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--void-bg);
+  color: #E2E8F0;
+  overflow-x: hidden;
+}
+
+.crt-overlay::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, 0.08) 0px,
+    rgba(0, 0, 0, 0.08) 2px,
+    transparent 2px,
+    transparent 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+  animation: scanline 8s linear infinite;
+}
+
+.neon-glow {
+  text-shadow: 0 0 5px var(--neon-purple), 0 0 20px var(--neon-purple), 0 0 40px var(--neon-purple);
+}
+
+.neon-glow-green {
+  text-shadow: 0 0 5px var(--terminal-green), 0 0 20px var(--terminal-green);
+}
+
+.neon-border {
+  border: 1px solid var(--neon-purple);
+  box-shadow: 0 0 5px var(--neon-purple), 0 0 20px var(--neon-purple), inset 0 0 5px rgba(124, 58, 237, 0.2);
+}
+
+@layer utilities {
+  .text-glow {
+    text-shadow: 0 0 7px var(--neon-purple), 0 0 20px var(--neon-purple);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

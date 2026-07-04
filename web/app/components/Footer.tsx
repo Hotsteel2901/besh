@@ -7,10 +7,10 @@ export default function Footer() {
             besh
           </div>
           <div className="flex gap-6 font-mono text-xs text-[#A78BFA]/60">
-            <a href="#" className="hover:text-[#00FF41] transition-colors">[src]</a>
-            <a href="#" className="hover:text-[#00FF41] transition-colors">[docs]</a>
-            <a href="#" className="hover:text-[#00FF41] transition-colors">[license]</a>
-            <a href="#" className="hover:text-[#00FF41] transition-colors">[contribute]</a>
+            <a href="https://github.com/Hotsteel2901/besh" target="_blank" rel="noopener noreferrer" className="hover:text-[#00FF41] transition-colors">[src]</a>
+            <a href="https://github.com/Hotsteel2901/besh#readme" target="_blank" rel="noopener noreferrer" className="hover:text-[#00FF41] transition-colors">[docs]</a>
+            <a href="https://github.com/Hotsteel2901/besh/blob/main/LICENSE" target="_blank" rel="noopener noreferrer" className="hover:text-[#00FF41] transition-colors">[license]</a>
+            <a href="https://github.com/Hotsteel2901/besh" target="_blank" rel="noopener noreferrer" className="hover:text-[#00FF41] transition-colors">[contribute]</a>
           </div>
         </div>
         <div className="text-center font-mono text-xs text-[#4C1D95]">

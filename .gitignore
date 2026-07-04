@@ -1,0 +1,14 @@
+# Conversation & docs
+2026-07-04-034153-empty-conversation.txt
+docs/
+.superpowers/
+.qoder/
+.qoder.db
+web/session-*.md
+
+# Build artifacts
+*.o
+besh
+node_modules/
+web/.next/
+web/out/

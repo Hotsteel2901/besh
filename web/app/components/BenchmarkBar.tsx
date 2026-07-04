@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState } from "react";
 import { useReducedMotion } from "@/app/hooks/useReducedMotion";
 
 interface Stat { label: string; value: number; suffix: string; }

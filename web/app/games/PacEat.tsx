@@ -43,7 +43,7 @@ export default function PacEat() {
     if (!ctx) return;
     const W = 400, H = 300;
 
-    let keys: Record<string, boolean> = {};
+    const keys: Record<string, boolean> = {};
     const onKey = (e: KeyboardEvent) => { keys[e.key] = true; e.preventDefault(); };
     const offKey = (e: KeyboardEvent) => { keys[e.key] = false; };
     window.addEventListener("keydown", onKey);

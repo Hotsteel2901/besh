@@ -338,10 +338,13 @@ char *expand_string(const char *str) {
 
     while (*p) {
         if (*p == '\\' && *(p+1)) {
-            p++;
-            if (blen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
-            buf[blen++] = *p++;
-            continue;
+            char nx = *(p+1);
+            if (nx == '$' || nx == '`' || nx == '"' || nx == '\\' || nx == '\n') {
+                p++;
+                if (blen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
+                buf[blen++] = *p++;
+                continue;
+            }
         }
         /* arithmetic expansion: $(( ... )) */
         if (*p == '$' && *(p+1) == '(' && *(p+2) == '(') {

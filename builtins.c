@@ -89,6 +89,7 @@ int builtin_echo(int argc, char **argv) {
     int newline = 1;
     int interpret_escapes = 0;
     int i = 1;
+    int first_arg;
 
     /* parse options */
     while (i < argc && argv[i][0] == '-') {
@@ -104,9 +105,10 @@ int builtin_echo(int argc, char **argv) {
             break;  /* not a flag */
         }
     }
+    first_arg = i;
 
     for (; i < argc; i++) {
-        if (i > 1) putchar(' ');
+        if (i > first_arg) putchar(' ');
 
         if (interpret_escapes) {
             for (char *p = argv[i]; *p; p++) {

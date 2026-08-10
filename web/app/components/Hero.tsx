@@ -13,7 +13,7 @@ const BESH_ASCII = [
   "  ╚╝╚═╩╝╚╩╝╚══╩══╩══╩═╝",
 ];
 
-const TAGLINE = "a bash-compatible shell written in C";
+const TAGLINE = "a bash-compatible shell written in C, remixed with fish & zsh";
 
 export default function Hero() {
   const taglineRef = useRef<HTMLParagraphElement>(null);
@@ -57,13 +57,13 @@ export default function Hero() {
 
         {/* Tech badges */}
         <div className="flex flex-wrap justify-center gap-3 mb-12">
-          {["C", "GCC", "POSIX", "AST", "Lexer", "Parser"].map((tag) => (
+          {["C", "GCC", "POSIX", "bash", "fish", "zsh", "autosuggest", "globstar"].map((tag) => (
             <span
               key={tag}
               className="px-3 py-1 text-xs font-mono border rounded-sm"
               style={{
-                borderColor: "#4C1D95",
-                color: "#A78BFA",
+                borderColor: tag === "fish" || tag === "zsh" ? "#00FF41" : "#4C1D95",
+                color: tag === "fish" || tag === "zsh" ? "#00FF41" : "#A78BFA",
                 background: "rgba(76,29,149,0.15)",
               }}
             >

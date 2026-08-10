@@ -235,6 +235,7 @@ static char *command_substitute(const char *cmd) {
         sh->jobs = NULL;
         sh->njob = 0;
         sh->job_interactive = 0;
+        fflush(NULL);   /* _exit skips stdio flush */
         _exit(execute_string(cmd));
     }
 
@@ -455,32 +456,40 @@ char **expand_words(char **words, int *count) {
     for (int i = 0; i < *count; i++) {
         char *expanded = expand_string(words[i]);
 
-        /* if noglob is set, skip globbing */
-        if (sh->opt_noglob) {
-            result[nresult++] = expanded;
-            continue;
-        }
+        /* brace expansion {a,b,c} */
+        int bc;
+        char **br = brace_expand(expanded, &bc);
+        free(expanded);
 
-        /* check if the word contains glob characters */
-        int has_glob = 0;
-        for (char *p = expanded; *p && !has_glob; p++)
-            if (*p == '*' || *p == '?' || *p == '[') has_glob = 1;
-
-        if (has_glob) {
-            int gcount = 0;
-            char **globs = glob_expand(expanded, &gcount);
-            if (gcount > 0) {
-                for (int j = 0; j < gcount && nresult < MAX_ARGS - 1; j++)
-                    result[nresult++] = globs[j];
-                free(globs);
-                free(expanded);
-            } else {
-                /* no match — keep literal */
-                result[nresult++] = expanded;
+        for (int b = 0; b < bc && nresult < MAX_ARGS - 1; b++) {
+            /* if noglob is set, skip globbing */
+            if (sh->opt_noglob) {
+                result[nresult++] = br[b];
+                continue;
             }
-        } else {
-            result[nresult++] = expanded;
+
+            /* check if the word contains glob characters */
+            int has_glob = 0;
+            for (char *p = br[b]; *p && !has_glob; p++)
+                if (*p == '*' || *p == '?' || *p == '[') has_glob = 1;
+
+            if (has_glob) {
+                int gcount = 0;
+                char **globs = glob_expand(br[b], &gcount);
+                if (gcount > 0) {
+                    for (int j = 0; j < gcount && nresult < MAX_ARGS - 1; j++)
+                        result[nresult++] = globs[j];
+                    free(globs);
+                    free(br[b]);
+                } else {
+                    /* no match — keep literal */
+                    result[nresult++] = br[b];
+                }
+            } else {
+                result[nresult++] = br[b];
+            }
         }
+        free(br);
     }
 
     *count = nresult;
@@ -489,7 +498,131 @@ char **expand_words(char **words, int *count) {
 }
 
 /* ---- wildcard globbing with glob(3) -------------------------- */
+/* growable string list used by the globstar walker */
+typedef struct {
+    char **items;
+    int    count;
+    int    cap;
+} StrList;
+
+static void strlist_add(StrList *sl, const char *s) {
+    if (sl->count >= sl->cap) {
+        sl->cap = sl->cap ? sl->cap * 2 : 16;
+        sl->items = sh_realloc(sl->items, sl->cap * sizeof(char *));
+    }
+    sl->items[sl->count++] = sh_strdup(s);
+}
+
+/* join base + name handling leading-slash base correctly */
+static void path_join(char *out, size_t outsz, const char *base, const char *name) {
+    if (!base || !*base)
+        snprintf(out, outsz, "%s", name);
+    else if (base[strlen(base) - 1] == '/')
+        snprintf(out, outsz, "%s%s", base, name);
+    else
+        snprintf(out, outsz, "%s/%s", base, name);
+}
+
+/* recursive walker implementing zsh-style '**' (globstar) */
+static void globstar_walk(const char *base, char **parts, int nparts, int idx,
+                          StrList *out) {
+    if (idx >= nparts) {
+        strlist_add(out, base);
+        return;
+    }
+    const char *part = parts[idx];
+
+    if (strcmp(part, "**") == 0) {
+        /* zero directories then the rest of the pattern */
+        globstar_walk(base, parts, nparts, idx + 1, out);
+        /* one or more directories: descend into every subdir */
+        DIR *d = opendir(*base ? base : ".");
+        if (!d) return;
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            struct stat st;
+            char path[MAX_PATH];
+            path_join(path, sizeof(path), base, e->d_name);
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+                globstar_walk(path, parts, nparts, idx, out);
+        }
+        closedir(d);
+        return;
+    }
+
+    int is_last = (idx == nparts - 1);
+    int has_wild = (strchr(part, '*') || strchr(part, '?') || strchr(part, '['));
+
+    if (!has_wild) {
+        /* literal name */
+        char path[MAX_PATH];
+        path_join(path, sizeof(path), base, part);
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            if (is_last)
+                strlist_add(out, path);
+            else if (S_ISDIR(st.st_mode))
+                globstar_walk(path, parts, nparts, idx + 1, out);
+        }
+        return;
+    }
+
+    DIR *d = opendir(*base ? base : ".");
+    if (!d) return;
+    struct dirent *e;
+    int flags = (part[0] == '.') ? 0 : FNM_PERIOD;  /* '*' skips dotfiles */
+    while ((e = readdir(d))) {
+        if (fnmatch(part, e->d_name, flags) != 0) continue;
+        char path[MAX_PATH];
+        path_join(path, sizeof(path), base, e->d_name);
+        if (is_last) {
+            strlist_add(out, path);
+        } else {
+            struct stat st;
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+                globstar_walk(path, parts, nparts, idx + 1, out);
+        }
+    }
+    closedir(d);
+}
+
+/* glob with globstar ('**' matches zero or more directories) */
+static char **globstar_glob(const char *pattern, int *count) {
+    int is_abs = (pattern[0] == '/');
+    const char *p = pattern;
+    if (is_abs) p++;
+    if (*p == '\0') { *count = 0; return NULL; }
+
+    char *copy = sh_strdup(p);
+    char *parts[512];
+    int nparts = 0;
+    char *save = NULL;
+    char *tok = strtok_r(copy, "/", &save);
+    while (tok && nparts < 511) {
+        parts[nparts++] = tok;
+        tok = strtok_r(NULL, "/", &save);
+    }
+
+    StrList out = { NULL, 0, 0 };
+    const char *base = is_abs ? "/" : "";
+    globstar_walk(base, parts, nparts, 0, &out);
+
+    free(copy);
+
+    if (out.count == 0) { *count = 0; free(out.items); return NULL; }
+    out.items[out.count] = NULL;
+    *count = out.count;
+    return out.items;
+}
+
 char **glob_expand(const char *pattern, int *count) {
+    Shell *sh = shell_get();
+
+    /* globstar: '**' anywhere enables recursive matching */
+    if (sh->opt_globstar && strstr(pattern, "**"))
+        return globstar_glob(pattern, count);
+
     glob_t gl;
     int flags = GLOB_TILDE | GLOB_BRACE | GLOB_MARK;
 
@@ -508,6 +641,155 @@ char **glob_expand(const char *pattern, int *count) {
 
     globfree(&gl);
     return result;
+}
+
+/* ================================================================
+ *  Brace expansion — {a,b,c} → a b c  (zsh/ksh feature)
+ *  Supports multiple groups and nesting.
+ * ================================================================ */
+static char **brace_rec(const char *s, int *count) {
+    char **one = sh_malloc(2 * sizeof(char *));
+    one[0] = sh_strdup(s);
+    one[1] = NULL;
+    *count = 1;
+
+    /* find first unescaped '{' */
+    const char *start = NULL;
+    for (const char *q = s; *q; q++) {
+        if (*q == '\\') { q++; continue; }
+        if (*q == '{') { start = q; break; }
+    }
+    if (!start) return one;
+
+    /* find matching '}' (nesting-aware) */
+    int depth = 0;
+    const char *end = NULL;
+    for (const char *q = start; *q; q++) {
+        if (*q == '\\') { q++; continue; }
+        if (*q == '{') depth++;
+        else if (*q == '}') {
+            depth--;
+            if (depth == 0) { end = q; break; }
+        }
+    }
+    if (!end) return one;  /* unbalanced — leave literal */
+
+    /* split the inside on top-level commas */
+    int inner_len = end - start - 1;
+    char *inner = sh_strndup(start + 1, inner_len);
+
+    char *opts[512];
+    int nopts = 0;
+    int cur = 0, d = 0;
+    for (int i = 0; i < inner_len; i++) {
+        char c = inner[i];
+        if (c == '\\') { i++; continue; }
+        if (c == '{') d++;
+        else if (c == '}') d--;
+        else if (c == ',' && d == 0) {
+            inner[i] = '\0';
+            opts[nopts++] = inner + cur;
+            cur = i + 1;
+            if (nopts >= 511) break;
+        }
+    }
+    if (nopts == 0) {
+        /* no commas — support numeric/alpha ranges: {1..5}, {a..c} */
+        int lo = 0, hi = 0;
+        char cl = 0, ch = 0;
+        int is_num = 0, is_alpha = 0;
+        if (sscanf(inner, "%d..%d", &lo, &hi) == 2 && lo <= hi)
+            is_num = 1;
+        else if (sscanf(inner, "%c..%c", &cl, &ch) == 2 && cl <= ch)
+            is_alpha = 1;
+
+        if (is_num || is_alpha) {
+            char *prefix = sh_strndup(s, start - s);
+            char *suffix = sh_strdup(end + 1);
+
+            char **out = sh_malloc(2 * sizeof(char *));
+            int nout = 0, cap = 2;
+
+            if (is_num) {
+                char num[32];
+                for (int v = lo; v <= hi; v++) {
+                    snprintf(num, sizeof(num), "%d", v);
+                    if (nout >= cap) { cap *= 2; out = sh_realloc(out, cap * sizeof(char *)); }
+                    size_t plen = strlen(prefix), nlen = strlen(num), slen = strlen(suffix);
+                    char *combined = sh_malloc(plen + nlen + slen + 1);
+                    memcpy(combined, prefix, plen);
+                    memcpy(combined + plen, num, nlen);
+                    memcpy(combined + plen + nlen, suffix, slen);
+                    combined[plen + nlen + slen] = '\0';
+                    out[nout++] = combined;
+                }
+            } else {
+                char chbuf[2] = { 0, 0 };
+                for (char v = cl; v <= ch; v++) {
+                    chbuf[0] = v;
+                    if (nout >= cap) { cap *= 2; out = sh_realloc(out, cap * sizeof(char *)); }
+                    size_t plen = strlen(prefix), nlen = 1, slen = strlen(suffix);
+                    char *combined = sh_malloc(plen + nlen + slen + 1);
+                    memcpy(combined, prefix, plen);
+                    memcpy(combined + plen, chbuf, 1);
+                    memcpy(combined + plen + nlen, suffix, slen);
+                    combined[plen + nlen + slen] = '\0';
+                    out[nout++] = combined;
+                }
+            }
+            out[nout] = NULL;
+
+            free(prefix);
+            free(suffix);
+            free(inner);
+            free(one[0]);
+            free(one);
+            *count = nout;
+            return out;
+        }
+
+        free(inner);
+        return one;
+    }
+    opts[nopts++] = inner + cur;
+
+    /* build combinations and recurse */
+    char *prefix = sh_strndup(s, start - s);
+    char *suffix = sh_strdup(end + 1);
+
+    char **out = sh_malloc(2 * sizeof(char *));
+    int nout = 0, cap = 2;
+
+    for (int i = 0; i < nopts; i++) {
+        size_t plen = strlen(prefix), olen = strlen(opts[i]), slen = strlen(suffix);
+        char *combined = sh_malloc(plen + olen + slen + 1);
+        memcpy(combined, prefix, plen);
+        memcpy(combined + plen, opts[i], olen);
+        memcpy(combined + plen + olen, suffix, slen);
+        combined[plen + olen + slen] = '\0';
+
+        int subc;
+        char **sub = brace_rec(combined, &subc);
+        free(combined);
+        for (int j = 0; j < subc; j++) {
+            if (nout >= cap) { cap *= 2; out = sh_realloc(out, cap * sizeof(char *)); }
+            out[nout++] = sub[j];
+        }
+        free(sub);
+    }
+    out[nout] = NULL;
+
+    free(prefix);
+    free(suffix);
+    free(inner);
+    free(one[0]);
+    free(one);
+    *count = nout;
+    return out;
+}
+
+char **brace_expand(const char *str, int *count) {
+    return brace_rec(str, count);
 }
 
 /* ---- variable name lookup (for export -p etc.) ---------------- */

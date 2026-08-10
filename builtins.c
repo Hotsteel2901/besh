@@ -10,43 +10,76 @@
 
 /* ================================================================
  *  cd [dir]  — change working directory
+ *  cd -      — previous directory (OLDPWD)
+ *  cd +N / -N — directory stack entry (zsh)
  * ================================================================ */
+int cd_to(const char *dir) {
+    Shell *sh = shell_get();
+
+    if (!dir || !*dir) {
+        dir = sh_getenv("HOME");
+        if (!dir) { fprintf(stderr, "besh: cd: HOME not set\n"); return 1; }
+    }
+    if (strcmp(dir, "-") == 0) {
+        const char *old = sh_getenv("OLDPWD");
+        if (!old) { fprintf(stderr, "besh: cd: OLDPWD not set\n"); return 1; }
+        printf("%s\n", old);
+        dir = old;
+    }
+
+    char *expanded = tilde_expand(dir);
+
+    char oldpwd[MAX_PATH];
+    getcwd(oldpwd, sizeof(oldpwd));
+
+    if (chdir(expanded) < 0) {
+        fprintf(stderr, "besh: cd: %s: %s\n", expanded, strerror(errno));
+        free(expanded);
+        return 1;
+    }
+    free(expanded);
+
+    char newpwd[MAX_PATH];
+    getcwd(newpwd, sizeof(newpwd));
+    snprintf(sh->cwd, sizeof(sh->cwd), "%s", newpwd);
+
+    sh_setenv("OLDPWD", oldpwd, 1);
+    sh_setenv("PWD", newpwd, 1);
+    return 0;
+}
+
 int builtin_cd(int argc, char **argv) {
     Shell *sh = shell_get();
-    const char *dir = NULL;
 
     if (argc > 2) {
         fprintf(stderr, "besh: cd: too many arguments\n");
         return 1;
     }
 
-    if (argc == 1 || (argc == 2 && strcmp(argv[1], "~") == 0)) {
-        dir = sh_getenv("HOME");
-        if (!dir) { fprintf(stderr, "besh: cd: HOME not set\n"); return 1; }
-    } else if (argc == 2 && strcmp(argv[1], "-") == 0) {
-        dir = sh_getenv("OLDPWD");
-        if (!dir) { fprintf(stderr, "besh: cd: OLDPWD not set\n"); return 1; }
-        printf("%s\n", dir);
-    } else {
-        dir = argv[1];
+    if (argc == 2) {
+        const char *arg = argv[1];
+        /* zsh-style directory stack: cd -N / cd +N */
+        if (arg[0] == '-' && arg[1] && arg[1] >= '0' && arg[1] <= '9') {
+            int n = atoi(arg + 1);
+            if (n <= 0 || n >= sh->ndirs) {
+                fprintf(stderr, "besh: cd: %s: no such directory in stack\n", arg);
+                return 1;
+            }
+            return cd_to(sh->dirs[n]);
+        }
+        if (arg[0] == '+' && arg[1] && arg[1] >= '0' && arg[1] <= '9') {
+            int n = atoi(arg + 1);
+            int idx = sh->ndirs - 1 - n;
+            if (idx < 0 || idx >= sh->ndirs) {
+                fprintf(stderr, "besh: cd: %s: no such directory in stack\n", arg);
+                return 1;
+            }
+            return cd_to(sh->dirs[idx]);
+        }
+        return cd_to(arg);
     }
 
-    /* save current dir as OLDPWD */
-    char oldpwd[MAX_PATH];
-    getcwd(oldpwd, sizeof(oldpwd));
-
-    if (chdir(dir) < 0) {
-        fprintf(stderr, "besh: cd: %s: %s\n", dir, strerror(errno));
-        return 1;
-    }
-
-    char newpwd[MAX_PATH];
-    getcwd(newpwd, sizeof(newpwd));
-    strncpy(sh->cwd, newpwd, sizeof(sh->cwd) - 1);
-
-    sh_setenv("OLDPWD", oldpwd, 1);
-    sh_setenv("PWD", newpwd, 1);
-    return 0;
+    return cd_to(NULL);
 }
 
 /* ================================================================
@@ -309,6 +342,307 @@ int builtin_unalias(int argc, char **argv) {
 }
 
 /* ================================================================
+ *  abbr — fish-style abbreviations (expand on space/enter)
+ *  abbr                       — list all
+ *  abbr name=value            — define
+ *  abbr -a name value...      — define (multi-word value)
+ *  abbr --erase name...       — remove
+ * ================================================================ */
+void abbr_add(const char *name, const char *value) {
+    Shell *sh = shell_get();
+    for (int i = 0; i < sh->nabbrs; i++) {
+        if (strcmp(sh->abbrs[i].name, name) == 0) {
+            free(sh->abbrs[i].value);
+            sh->abbrs[i].value = sh_strdup(value);
+            return;
+        }
+    }
+    if (sh->nabbrs >= sh->abbrs_cap) {
+        sh->abbrs_cap = sh->abbrs_cap ? sh->abbrs_cap * 2 : 64;
+        sh->abbrs = sh_realloc(sh->abbrs, sh->abbrs_cap * sizeof(Alias));
+    }
+    sh->abbrs[sh->nabbrs].name  = sh_strdup(name);
+    sh->abbrs[sh->nabbrs].value = sh_strdup(value);
+    sh->nabbrs++;
+}
+
+char *abbr_find(const char *name) {
+    Shell *sh = shell_get();
+    for (int i = 0; i < sh->nabbrs; i++)
+        if (strcmp(sh->abbrs[i].name, name) == 0)
+            return sh->abbrs[i].value;
+    return NULL;
+}
+
+int abbr_erase(const char *name) {
+    Shell *sh = shell_get();
+    for (int i = 0; i < sh->nabbrs; i++) {
+        if (strcmp(sh->abbrs[i].name, name) == 0) {
+            free(sh->abbrs[i].name);
+            free(sh->abbrs[i].value);
+            memmove(&sh->abbrs[i], &sh->abbrs[i+1],
+                    (sh->nabbrs - i - 1) * sizeof(Alias));
+            sh->nabbrs--;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int builtin_abbr(int argc, char **argv) {
+    Shell *sh = shell_get();
+
+    if (argc == 1) {
+        for (int i = 0; i < sh->nabbrs; i++)
+            printf("abbr %s %s\n", sh->abbrs[i].name, sh->abbrs[i].value);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--erase") == 0 || strcmp(argv[1], "-e") == 0 ||
+        strcmp(argv[1], "-a") == 0) {
+        for (int i = 2; i < argc; i++) {
+            if (argv[1][1] == 'a') {
+                /* abbr -a name value... */
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "besh: abbr: missing value for %s\n", argv[i]);
+                    continue;
+                }
+                char val[MAX_LINE] = "";
+                for (int j = i + 1; j < argc; j++) {
+                    if (j > i + 1) strcat(val, " ");
+                    strncat(val, argv[j], MAX_LINE - strlen(val) - 1);
+                }
+                abbr_add(argv[i], val);
+                i = argc;
+            } else {
+                abbr_erase(argv[i]);
+            }
+        }
+        return 0;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        char *eq = strchr(argv[i], '=');
+        if (eq) {
+            char *name = sh_strndup(argv[i], eq - argv[i]);
+            char *val  = sh_strdup(eq + 1);
+            /* strip surrounding quotes like alias does */
+            int vlen = strlen(val);
+            if (vlen >= 2 && ((val[0] == '\'' && val[vlen-1] == '\'') ||
+                              (val[0] == '"' && val[vlen-1] == '"'))) {
+                val[vlen-1] = '\0';
+                memmove(val, val + 1, vlen - 1);
+            }
+            abbr_add(name, val);
+            free(name);
+            free(val);
+        } else {
+            char *v = abbr_find(argv[i]);
+            if (v) printf("abbr %s %s\n", argv[i], v);
+            else {
+                fprintf(stderr, "besh: abbr: %s: no such abbreviation\n", argv[i]);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ================================================================
+ *  Directory stack (zsh-style)
+ *  dirs [-v]  — print the stack (index 0 = current dir)
+ *  pushd [dir] — cd to dir, pushing the old one; no arg swaps
+ *  popd       — cd to the directory below the top, drop the top
+ * ================================================================ */
+void dirs_push(const char *dir) {
+    Shell *sh = shell_get();
+    if (sh->ndirs >= sh->dirs_cap) {
+        sh->dirs_cap = sh->dirs_cap ? sh->dirs_cap * 2 : 16;
+        sh->dirs = sh_realloc(sh->dirs, sh->dirs_cap * sizeof(char *));
+    }
+    memmove(sh->dirs + 1, sh->dirs, sh->ndirs * sizeof(char *));
+    sh->dirs[0] = sh_strdup(dir);
+    sh->ndirs++;
+}
+
+void dirs_print(int verbose) {
+    Shell *sh = shell_get();
+    if (verbose) {
+        for (int i = 0; i < sh->ndirs; i++) {
+            char *h = sh_getenv("HOME");
+            const char *d = sh->dirs[i];
+            if (h && strncmp(d, h, strlen(h)) == 0)
+                printf("%d\t~%s\n", i, d + strlen(h));
+            else
+                printf("%d\t%s\n", i, d);
+        }
+    } else {
+        for (int i = 0; i < sh->ndirs; i++)
+            printf("%s ", sh->dirs[i]);
+        printf("\n");
+    }
+}
+
+int builtin_dirs(int argc, char **argv) {
+    Shell *sh = shell_get();
+    int verbose = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0) verbose = 1;
+        else if (strcmp(argv[i], "-c") == 0) {
+            for (int j = 0; j < sh->ndirs; j++) free(sh->dirs[j]);
+            sh->ndirs = 0;
+            return 0;
+        }
+    }
+    dirs_print(verbose);
+    return 0;
+}
+
+int builtin_pushd(int argc, char **argv) {
+    Shell *sh = shell_get();
+    char cur[MAX_PATH];
+    getcwd(cur, sizeof(cur));
+
+    if (argc == 1) {
+        /* swap top two entries */
+        if (sh->ndirs < 2) {
+            fprintf(stderr, "besh: pushd: no other directory\n");
+            return 1;
+        }
+        char target[MAX_PATH];
+        snprintf(target, sizeof(target), "%s", sh->dirs[1]);
+        if (cd_to(target)) return 1;
+        free(sh->dirs[1]);
+        sh->dirs[1] = sh_strdup(cur);
+        dirs_print(0);
+        return 0;
+    }
+
+    if (cd_to(argv[1])) return 1;
+
+    char newcur[MAX_PATH];
+    getcwd(newcur, sizeof(newcur));
+    dirs_push(newcur);
+    dirs_print(0);
+    return 0;
+}
+
+int builtin_popd(int argc, char **argv) {
+    (void)argc; (void)argv;
+    Shell *sh = shell_get();
+    if (sh->ndirs < 2) {
+        fprintf(stderr, "besh: popd: directory stack empty\n");
+        return 1;
+    }
+    char target[MAX_PATH];
+    snprintf(target, sizeof(target), "%s", sh->dirs[1]);
+    if (cd_to(target)) return 1;
+
+    free(sh->dirs[0]);
+    memmove(sh->dirs, sh->dirs + 1, (sh->ndirs - 1) * sizeof(char *));
+    sh->ndirs--;
+    dirs_print(0);
+    return 0;
+}
+
+/* ================================================================
+ *  setopt / unsetopt — zsh-style option management
+ *  setopt                      — print all option states
+ *  setopt name...              — enable options
+ *  unsetopt name...            — disable options
+ * ================================================================ */
+typedef struct { const char *name; size_t offset; } OptionEntry;
+
+static OptionEntry option_table[] = {
+    {"autocd",          offsetof(Shell, opt_autocd)},
+    {"globstar",        offsetof(Shell, opt_globstar)},
+    {"autosuggest",     offsetof(Shell, opt_autosuggest)},
+    {"syntaxhighlight", offsetof(Shell, opt_syntaxhighlight)},
+    {"histignoredups",  offsetof(Shell, opt_histignoredups)},
+    {"noclobber",       offsetof(Shell, opt_noclobber)},
+    {"allexport",       offsetof(Shell, opt_allexport)},
+    {"xtrace",          offsetof(Shell, opt_xtrace)},
+    {"verbose",         offsetof(Shell, opt_verbose)},
+    {"noglob",          offsetof(Shell, opt_noglob)},
+    {NULL, 0}
+};
+
+static int *option_flag(const char *name) {
+    Shell *sh = shell_get();
+    for (int i = 0; option_table[i].name; i++) {
+        if (strcmp(name, option_table[i].name) == 0)
+            return (int *)((char *)sh + option_table[i].offset);
+    }
+    return NULL;
+}
+
+static void options_print(void) {
+    Shell *sh = shell_get();
+    for (int i = 0; option_table[i].name; i++) {
+        int *ptr = (int *)((char *)sh + option_table[i].offset);
+        if (*ptr)
+            printf("setopt %s\n", option_table[i].name);
+        else
+            printf("unsetopt %s\n", option_table[i].name);
+    }
+}
+
+int builtin_setopt(int argc, char **argv) {
+    if (argc == 1) { options_print(); return 0; }
+    for (int i = 1; i < argc; i++) {
+        int *p = option_flag(argv[i]);
+        if (!p) { fprintf(stderr, "besh: setopt: unknown option: %s\n", argv[i]); return 1; }
+        *p = 1;
+    }
+    return 0;
+}
+
+int builtin_unsetopt(int argc, char **argv) {
+    if (argc == 1) { options_print(); return 0; }
+    for (int i = 1; i < argc; i++) {
+        int *p = option_flag(argv[i]);
+        if (!p) { fprintf(stderr, "besh: unsetopt: unknown option: %s\n", argv[i]); return 1; }
+        *p = 0;
+    }
+    return 0;
+}
+
+/* ================================================================
+ *  readonly [name[=value]]...  — mark variables read-only
+ * ================================================================ */
+int builtin_readonly(int argc, char **argv) {
+    Shell *sh = shell_get();
+
+    if (argc == 1) {
+        for (int i = 0; i < sh->nvars; i++)
+            if (sh->vars[i].readonly)
+                printf("readonly %s=\"%s\"\n", sh->vars[i].name,
+                       sh->vars[i].value ? sh->vars[i].value : "");
+        return 0;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        char *eq = strchr(argv[i], '=');
+        if (eq) {
+            char *name = sh_strndup(argv[i], eq - argv[i]);
+            char *val  = sh_strdup(eq + 1);
+            sh_setenv(name, val, 0);
+            free(val);
+            for (int j = 0; j < sh->nvars; j++)
+                if (strcmp(sh->vars[j].name, name) == 0)
+                    sh->vars[j].readonly = 1;
+            free(name);
+        } else {
+            for (int j = 0; j < sh->nvars; j++)
+                if (strcmp(sh->vars[j].name, argv[i]) == 0)
+                    sh->vars[j].readonly = 1;
+        }
+    }
+    return 0;
+}
+
+/* ================================================================
  *  source filename  (or  . filename)
  * ================================================================ */
 int builtin_source(int argc, char **argv) {
@@ -453,12 +787,14 @@ int builtin_fg(int argc, char **argv) {
     }
 
     /* wait for all pids */
+    sigchld_block();
     for (int i = 0; i < j->npids; i++) {
         if (j->pids[i] != 0) {
             int status;
             waitpid(j->pids[i], &status, WUNTRACED);
         }
     }
+    sigchld_unblock();
 
     if (sh->job_interactive) {
         tcsetpgrp(sh->term_fd, sh->shell_pgid);
@@ -554,12 +890,24 @@ int builtin_set(int argc, char **argv) {
         if (strcmp(argv[i], "+C") == 0) { sh->opt_noclobber = 0; continue; }
         if (strcmp(argv[i], "-a") == 0) { sh->opt_allexport = 1; continue; }
         if (strcmp(argv[i], "+a") == 0) { sh->opt_allexport = 0; continue; }
+        /* zsh-style: set -o name / set +o name */
+        if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "+o") == 0) {
+            int val = (argv[i][0] == '+') ? 0 : 1;
+            if (i + 1 < argc) {
+                int *p = option_flag(argv[++i]);
+                if (p) *p = val;
+                else fprintf(stderr, "besh: set: unknown option: %s\n", argv[i]);
+            } else {
+                options_print();
+            }
+            continue;
+        }
     }
     return 0;
 }
 
 /* ================================================================
- *  read [-p prompt] [-r] var  — read a line from stdin
+ *  read [-p prompt] [-r] var...  — read a line, split on IFS
  * ================================================================ */
 int builtin_read(int argc, char **argv) {
     int raw = 0;
@@ -572,12 +920,8 @@ int builtin_read(int argc, char **argv) {
             prompt = argv[++i];
             continue;
         }
+        if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) { ++i; continue; }
         break;
-    }
-
-    if (i >= argc) {
-        fprintf(stderr, "besh: read: variable name required\n");
-        return 1;
     }
 
     if (prompt) {
@@ -595,12 +939,59 @@ int builtin_read(int argc, char **argv) {
         buf[--len] = '\0';
 
     if (!raw) {
-        /* strip backslash escapes */
-        /* (simplified — just strip trailing backslash) */
-        if (len > 0 && buf[len-1] == '\\') buf[--len] = '\0';
+        /* fold \<newline> continuations and strip unescaped backslashes */
+        char out[MAX_LINE];
+        int o = 0;
+        for (size_t k = 0; k < len; k++) {
+            if (buf[k] == '\\' && k + 1 < len && buf[k+1] == '\n') { k++; continue; }
+            out[o++] = buf[k];
+        }
+        out[o] = '\0';
+        len = o;
+        memcpy(buf, out, o + 1);
     }
 
-    sh_setenv(argv[i], buf, 0);
+    if (i >= argc) {
+        /* no variable given → REPLY */
+        sh_setenv("REPLY", buf, 0);
+        return 0;
+    }
+
+    int nvars = argc - i;
+
+    /* tokenize on the first IFS char (default: whitespace) */
+    const char *ifs = sh_getenv("IFS");
+    char sep[3] = " \t";
+    if (ifs && *ifs) {
+        snprintf(sep, sizeof(sep), "%c", *ifs);
+        if (strchr(ifs, ' ')) { sep[0] = ' '; sep[1] = '\t'; sep[2] = '\0'; }
+    }
+
+    char *tokens[MAX_LINE];
+    int ntok = 0;
+    char *save = NULL;
+    char *tok = strtok_r(buf, sep, &save);
+    while (tok && ntok < MAX_LINE) {
+        tokens[ntok++] = tok;
+        tok = strtok_r(NULL, sep, &save);
+    }
+
+    int v;
+    for (v = 0; v < nvars; v++) {
+        if (v < ntok - 1) {
+            sh_setenv(argv[i + v], tokens[v], 0);
+        } else if (v == nvars - 1) {
+            /* last variable gets the remainder */
+            char joined[MAX_LINE] = "";
+            for (int k = v; k < ntok; k++) {
+                if (k > v) strcat(joined, " ");
+                strncat(joined, tokens[k], MAX_LINE - strlen(joined) - 1);
+            }
+            sh_setenv(argv[i + v], joined, 0);
+        } else {
+            sh_setenv(argv[i + v], "", 0);
+        }
+    }
     return 0;
 }
 
@@ -711,11 +1102,31 @@ int builtin_wait(int argc, char **argv) {
 }
 
 /* ================================================================
- *  shift [n]  — shift positional parameters
+ *  shift [n]  — shift positional parameters ($1..$n → $1..)
  * ================================================================ */
 int builtin_shift(int argc, char **argv) {
-    (void)argc; (void)argv;
-    /* positional parameters not fully implemented */
+    Shell *sh = shell_get();
+    int n = 1;
+    if (argc > 1) {
+        char *end;
+        long v = strtol(argv[1], &end, 10);
+        if (*end != '\0' || v < 0) {
+            fprintf(stderr, "besh: shift: %s: numeric argument required\n", argv[1]);
+            return 1;
+        }
+        n = (int)v;
+    }
+    if (n > sh->npositional) n = sh->npositional;
+
+    for (int i = 0; i < n; i++)
+        free(sh->positional[i]);
+    memmove(sh->positional, sh->positional + n,
+            (sh->npositional - n) * sizeof(char *));
+    sh->npositional -= n;
+    if (sh->npositional == 0) {
+        free(sh->positional);
+        sh->positional = NULL;
+    }
     return 0;
 }
 
@@ -803,10 +1214,14 @@ static int builtin_help(int argc, char **argv) {
             printf("besh: help: no help for %s\n", argv[1]);
     } else {
         printf("besh built-in commands:\n");
-        printf("  alias  bg  cd  echo  exec  exit  export  false  fg  help\n");
-        printf("  history  jobs  pwd  read  set  shift  source  test  times\n");
-        printf("  trap  true  type  umask  unalias  unset  [\n");
+        printf("  abbr  alias  bg  cd  dirs  echo  exec  exit  export  false\n");
+        printf("  fg  help  history  jobs  popd  pushd  pwd  read  readonly\n");
+        printf("  set  setopt  shift  source  test  times  trap  true  type\n");
+        printf("  umask  unalias  unset  unsetopt  [\n");
         printf("Type 'help name' for more info.\n");
+        printf("\nfish/zsh features: autosuggestions (right-arrow/Tab),\n");
+        printf("  syntax highlighting, abbr, Ctrl-R reverse search,\n");
+        printf("  autocd, globstar '**', brace {a,b} expansion, dirs stack.\n");
     }
     return 0;
 }
@@ -880,6 +1295,13 @@ static const BuiltinEntry builtins[] = {
     {"break",   builtin_break},
     {"continue",builtin_continue},
     {"return",  builtin_return},
+    {"abbr",    builtin_abbr},
+    {"pushd",   builtin_pushd},
+    {"popd",    builtin_popd},
+    {"dirs",    builtin_dirs},
+    {"setopt",  builtin_setopt},
+    {"unsetopt",builtin_unsetopt},
+    {"readonly",builtin_readonly},
     {"help",    builtin_help},
     {NULL, NULL}
 };

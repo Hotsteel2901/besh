@@ -9,13 +9,16 @@ const BUILTINS = [
   { name: "ls", desc: "List directory (via exec)" },
   { name: "export", desc: "Set env variables" },
   { name: "unset", desc: "Remove variables" },
+  { name: "readonly", desc: "Freeze a variable" },
   { name: "alias", desc: "Define aliases" },
   { name: "unalias", desc: "Remove aliases" },
+  { name: "abbr", desc: "Fish-style abbreviation" },
   { name: "source", desc: "Execute script file" },
   { name: "exit", desc: "Exit the shell" },
   { name: "jobs", desc: "List background jobs" },
   { name: "fg", desc: "Foreground job" },
   { name: "bg", desc: "Background job" },
+  { name: "wait", desc: "Wait for jobs" },
   { name: "history", desc: "Command history" },
   { name: "read", desc: "Read from stdin" },
   { name: "test/[", desc: "Conditional eval" },
@@ -30,6 +33,11 @@ const BUILTINS = [
   { name: "continue", desc: "Next iteration" },
   { name: "return", desc: "Return from function" },
   { name: "set", desc: "Shell options" },
+  { name: "setopt", desc: "Enable zsh-style option" },
+  { name: "unsetopt", desc: "Disable option" },
+  { name: "pushd", desc: "Push dir stack" },
+  { name: "popd", desc: "Pop dir stack" },
+  { name: "dirs", desc: "Show dir stack" },
   { name: "type", desc: "Command type info" },
   { name: "help", desc: "Builtin help" },
 ];
@@ -46,7 +54,7 @@ export default function BuiltinsGrid() {
           /builtins
         </h2>
         <p className="font-mono text-sm text-[#A78BFA]/60 max-w-xl mx-auto">
-          29 built-in commands powering the shell experience
+          38 built-in commands powering the shell experience
         </p>
       </div>
 

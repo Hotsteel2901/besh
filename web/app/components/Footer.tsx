@@ -14,8 +14,8 @@ export default function Footer() {
           </div>
         </div>
         <div className="text-center font-mono text-xs text-[#4C1D95]">
-          <p>besh v1.0.0 — a bash-compatible shell written in C</p>
-          <p className="mt-1">Built with 3400 lines of pure C, zero dependencies, and a lot of 80&apos;s terminal nostalgia.</p>
+          <p>besh v1.1.0 — a bash-compatible shell written in C, remixed with fish &amp; zsh</p>
+          <p className="mt-1">Built with 6100+ lines of pure C, zero dependencies, and a lot of 80&apos;s terminal nostalgia.</p>
           <p className="mt-3 text-[#00FF41]/30">████████ READY ████████</p>
         </div>
       </div>

@@ -2,7 +2,7 @@
 # ================================================================
 
 CC      := gcc
-CFLAGS  := -Wall -Wextra -O2 -g
+CFLAGS  := -Wall -Wextra -O2 -g -Wno-format-truncation
 LDFLAGS :=
 LDLIBS  :=
 
@@ -51,5 +51,26 @@ test: $(TARGET)
 	@echo ""
 	@echo "=== Test 8: History ==="
 	@printf "echo first\necho second\nhistory\n" | ./$(TARGET)
+	@echo ""
+	@echo "=== Test 9: Globbing (globstar) ==="
+	@mkdir -p /tmp/besh_t/a/b && touch /tmp/besh_t/a/1.c /tmp/besh_t/a/b/2.c
+	@echo "cd /tmp/besh_t && echo *.c && echo **/*.c" | ./$(TARGET)
+	@rm -rf /tmp/besh_t
+	@echo ""
+	@echo "=== Test 10: Brace expansion ==="
+	@echo "echo {a,b,c}.txt {1..4}" | ./$(TARGET)
+	@echo ""
+	@echo "=== Test 11: autocd (implicit cd) ==="
+	@mkdir -p /tmp/besh_ac && echo "cd /tmp && besh_ac && pwd" | ./$(TARGET)
+	@rm -rf /tmp/besh_ac
+	@echo ""
+	@echo "=== Test 12: dirs / pushd / popd ==="
+	@echo "dirs && pushd /tmp && popd" | ./$(TARGET)
+	@echo ""
+	@echo "=== Test 13: Functions + shift ==="
+	@printf 'f() { echo "\$$1"; shift; echo "\$$1"; }; f a b c\n' | ./$(TARGET)
+	@echo ""
+	@echo "=== Test 14: setopt / unsetopt ==="
+	@echo "setopt autocd && setopt | grep autocd" | ./$(TARGET)
 	@echo ""
 	@echo "=== All tests done ==="

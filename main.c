@@ -167,8 +167,12 @@ void signals_setup(void) {
 
         sh->shell_pgid = getpid();
         if (setpgid(sh->shell_pgid, sh->shell_pgid) < 0) {
-            perror("besh: setpgid");
-            exit(1);
+            /* EPERM means we are already a session leader with our own
+             * process group (e.g. started under script/pty) — fine. */
+            if (errno != EPERM) {
+                perror("besh: setpgid");
+                exit(1);
+            }
         }
         tcsetpgrp(sh->term_fd, sh->shell_pgid);
 
@@ -199,6 +203,22 @@ void signals_unblock(void) {
     sigemptyset(&set);
     sigaddset(&set, SIGCHLD);
     sigaddset(&set, SIGINT);
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+}
+
+/* block/unblock only SIGCHLD — used so the signal handler cannot reap a
+ * foreground child while we are explicitly waiting on it (avoids ECHILD) */
+void sigchld_block(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+}
+
+void sigchld_unblock(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
     sigprocmask(SIG_UNBLOCK, &set, NULL);
 }
 
@@ -280,26 +300,201 @@ static int read_key(void) {
     return 27;
 }
 
+/* ================================================================
+ *  FISH-STYLE SYNTAX HIGHLIGHTING
+ *  Colors commands (green=valid, red=invalid), options (yellow),
+ *  directories (blue), variables (cyan), numbers (magenta),
+ *  and quoted strings.
+ * ================================================================ */
+static void line_insert(char c);   /* defined below (used by suggestion) */
+
+static int hl_is_known_command(const char *w) {
+    Shell *sh = shell_get();
+    if (!w || !*w) return 0;
+    if (builtin_is(w)) return 1;
+    for (int i = 0; i < sh->nfuncs; i++)
+        if (strcmp(sh->funcs[i].name, w) == 0) return 1;
+    for (int i = 0; i < sh->naliases; i++)
+        if (strcmp(sh->aliases[i].name, w) == 0) return 1;
+    if (strchr(w, '/')) return access(w, X_OK) == 0;
+    char *p = resolve_path(w);
+    if (p) { free(p); return 1; }
+    return 0;
+}
+
+/* read one "word" starting at p, honoring quotes/escapes; returns end ptr */
+static const char *hl_scan_word(const char *p) {
+    char quote = 0;
+    while (*p) {
+        char c = *p;
+        if (quote) {
+            if (c == quote) quote = 0;
+            else if (c == '\\' && quote == '"' && p[1]) p++;
+        } else {
+            if (c == '\'' || c == '"') quote = c;
+            else if (c == '\\' && p[1]) { p++; }
+            else if (sh_is_whitespace(c)) break;
+        }
+        p++;
+    }
+    return p;
+}
+
+static void write_highlighted(int fd, const char *line) {
+    static char ob[131072];
+    int o = 0;
+    const char *p = line;
+    int first = 1;   /* command position */
+
+    while (*p) {
+        if (*p == ' ' || *p == '\t') {
+            if (o + 8 >= (int)sizeof(ob)) { write(fd, ob, o); o = 0; }
+            ob[o++] = *p++;
+            continue;
+        }
+
+        const char *end = hl_scan_word(p);
+        int wlen = end - p;
+        char *word = sh_strndup(p, wlen);
+
+        const char *color;
+        if (first) {
+            color = hl_is_known_command(word) ? "\x1b[1;32m" : "\x1b[1;31m";
+        } else if (word[0] == '-' && word[1] && word[1] != '\0') {
+            color = "\x1b[0;33m";                 /* options */
+        } else if (word[0] == '$' && word[1]) {
+            color = "\x1b[0;36m";                 /* variables */
+        } else if (word[0] == '\'' || word[0] == '"') {
+            color = "\x1b[0;32m";                 /* quoted strings */
+        } else if (strchr(word, '<') || strchr(word, '>')) {
+            color = "\x1b[1;35m";                 /* redirections */
+        } else {
+            int numeric = 1;
+            for (const char *q = word; *q; q++) {
+                if (!(*q >= '0' && *q <= '9')) { numeric = 0; break; }
+            }
+            if (numeric) color = "\x1b[0;35m";    /* numbers */
+            else {
+                struct stat st;
+                if (stat(word, &st) == 0 && S_ISDIR(st.st_mode))
+                    color = "\x1b[1;34m";         /* directories */
+                else
+                    color = NULL;                 /* normal */
+            }
+        }
+
+        if (o + wlen + 32 >= (int)sizeof(ob)) { write(fd, ob, o); o = 0; }
+        if (color) {
+            int n = snprintf(ob + o, sizeof(ob) - o, "%s", color);
+            o += n;
+        }
+        memcpy(ob + o, p, wlen);
+        o += wlen;
+        if (color) {
+            int n = snprintf(ob + o, sizeof(ob) - o, "\x1b[0m");
+            o += n;
+        }
+
+        free(word);
+        p = end;
+        first = 0;
+    }
+    ob[o] = '\0';
+    write(fd, ob, o);
+}
+
+/* ================================================================
+ *  FISH-STYLE AUTOSUGGESTIONS
+ *  Suggests the most recent history entry matching the prefix.
+ * ================================================================ */
+static int autosuggest_update(void) {
+    Shell *sh = shell_get();
+    free(sh->suggestion);
+    sh->suggestion = NULL;
+    if (sh->line_len == 0) return 0;
+
+    for (int i = sh->nhist - 1; i >= 0; i--) {
+        if (strncmp(sh->history[i], sh->line_buf, sh->line_len) == 0 &&
+            (size_t)sh->line_len < strlen(sh->history[i])) {
+            sh->suggestion = sh_strdup(sh->history[i] + sh->line_len);
+            return strlen(sh->suggestion);
+        }
+    }
+    return 0;
+}
+
+static void accept_suggestion(void) {
+    Shell *sh = shell_get();
+    if (!sh->suggestion) return;
+    for (char *q = sh->suggestion; *q; q++) line_insert(*q);
+    free(sh->suggestion);
+    sh->suggestion = NULL;
+}
+
+/* expand a fish-style abbreviation right before the cursor */
+static int abbr_expand_at_cursor(void) {
+    Shell *sh = shell_get();
+    int start = sh->line_pos;
+    while (start > 0 && sh->line_buf[start - 1] != ' ' &&
+           sh->line_buf[start - 1] != '\t' && sh->line_buf[start - 1] != '|' &&
+           sh->line_buf[start - 1] != '&' && sh->line_buf[start - 1] != ';' &&
+           sh->line_buf[start - 1] != '<' && sh->line_buf[start - 1] != '>')
+        start--;
+
+    int wlen = sh->line_pos - start;
+    if (wlen == 0) return 0;
+
+    char *word = sh_strndup(sh->line_buf + start, wlen);
+    char *val = abbr_find(word);
+    free(word);
+    if (!val) return 0;
+
+    int vlen = strlen(val);
+    if (vlen == 0) return 0;
+
+    /* replace the abbreviation with its expansion */
+    memmove(sh->line_buf + start + vlen,
+            sh->line_buf + sh->line_pos,
+            sh->line_len - sh->line_pos + 1);
+    memcpy(sh->line_buf + start, val, vlen);
+    sh->line_len += vlen - wlen;
+    sh->line_pos = start + vlen;
+    return 1;
+}
+
 /* redraw the line from cursor position */
 static void line_refresh(void) {
     Shell *sh = shell_get();
     int pos = 0;
-    static char buf[65536];
-    char saved;
+    static char buf[131072];
 
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "\r\x1b[K");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s", sh->prompt);
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s", sh->line_buf);
+    /* clear the line and write the prompt */
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\r\x1b[K%s", sh->prompt);
     write(sh->term_fd, buf, pos);
-
     pos = 0;
-    saved = sh->line_buf[sh->line_pos];
-    sh->line_buf[sh->line_pos] = '\0';
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "\r");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s", sh->prompt);
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s", sh->line_buf);
-    write(sh->term_fd, buf, pos);
-    sh->line_buf[sh->line_pos] = saved;
+
+    /* write the input (with fish-style syntax highlighting) */
+    if (sh->opt_syntaxhighlight)
+        write_highlighted(sh->term_fd, sh->line_buf);
+    else
+        write(sh->term_fd, sh->line_buf, sh->line_len);
+
+    /* fish-style autosuggestion (dim, after the cursor when at EOL) */
+    int sugg = 0;
+    if (sh->opt_autosuggest && sh->line_pos == sh->line_len)
+        sugg = autosuggest_update();
+    if (sugg > 0) {
+        static char sbuf[131072];
+        int n = snprintf(sbuf, sizeof(sbuf), "\x1b[2m%s\x1b[22m", sh->suggestion);
+        write(sh->term_fd, sbuf, n);
+    }
+
+    /* reposition the cursor using cursor-left escapes */
+    int nleft = sh->line_len - sh->line_pos + sugg;
+    if (nleft > 0) {
+        int n = snprintf(buf, sizeof(buf), "\x1b[%dD", nleft);
+        write(sh->term_fd, buf, n);
+    }
 }
 
 /* insert char at cursor */
@@ -356,33 +551,83 @@ static void line_kill_to_start(void) {
     sh->line_pos = 0;
 }
 
-/* history navigation */
+/* history navigation with fish-style prefix search:
+ * if the current line is non-empty, ↑ recalls older commands that
+ * start with it; once recalled, ↓ walks forward or restores. */
 static void history_up(void) {
     Shell *sh = shell_get();
-    if (sh->nhist == 0 || sh->hist_pos <= 0) return;
-    if (sh->hist_pos == sh->nhist) {
-        /* save current line before browsing */
-        free(sh->history[sh->nhist]);  /* temporary slot */
+    if (sh->nhist == 0) return;
+
+    /* start a new search on the first ↑ with a non-empty line */
+    if (sh->hist_search == NULL && sh->line_len > 0) {
+        sh->hist_search = sh_strdup(sh->line_buf);
+        free(sh->history[sh->nhist]);
         sh->history[sh->nhist] = sh_strdup(sh->line_buf);
+        sh->hist_pos = sh->nhist;
     }
-    sh->hist_pos--;
-    strncpy(sh->line_buf, sh->history[sh->hist_pos], sh->line_cap - 1);
-    sh->line_len = strlen(sh->line_buf);
-    sh->line_pos = sh->line_len;
+
+    int i = sh->hist_pos - 1;
+    while (i >= 0) {
+        if (sh->hist_search == NULL ||
+            strncmp(sh->history[i], sh->hist_search,
+                    strlen(sh->hist_search)) == 0) {
+            sh->hist_pos = i;
+            strncpy(sh->line_buf, sh->history[i], sh->line_cap - 1);
+            sh->line_len = strlen(sh->line_buf);
+            sh->line_pos = sh->line_len;
+            return;
+        }
+        i--;
+    }
+    write(sh->term_fd, "\a", 1);  /* no more matches */
 }
 
 static void history_down(void) {
     Shell *sh = shell_get();
     if (sh->hist_pos >= sh->nhist) return;
-    sh->hist_pos++;
-    if (sh->hist_pos == sh->nhist) {
-        /* restore saved line */
+
+    int i = sh->hist_pos + 1;
+    if (sh->hist_search) {
+        while (i < sh->nhist) {
+            if (strncmp(sh->history[i], sh->hist_search,
+                        strlen(sh->hist_search)) == 0) {
+                sh->hist_pos = i;
+                strncpy(sh->line_buf, sh->history[i], sh->line_cap - 1);
+                sh->line_len = strlen(sh->line_buf);
+                sh->line_pos = sh->line_len;
+                return;
+            }
+            i++;
+        }
+        /* walked past all matches — restore the typed line */
+        sh->hist_pos = sh->nhist;
+        strncpy(sh->line_buf, sh->history[sh->nhist], sh->line_cap - 1);
+        sh->line_len = strlen(sh->line_buf);
+        sh->line_pos = sh->line_len;
+        free(sh->hist_search);
+        sh->hist_search = NULL;
+        return;
+    }
+
+    if (i == sh->nhist) {
+        /* restore the line typed before browsing */
+        sh->hist_pos = i;
         strncpy(sh->line_buf, sh->history[sh->nhist], sh->line_cap - 1);
     } else {
-        strncpy(sh->line_buf, sh->history[sh->hist_pos], sh->line_cap - 1);
+        sh->hist_pos = i;
+        strncpy(sh->line_buf, sh->history[i], sh->line_cap - 1);
     }
     sh->line_len = strlen(sh->line_buf);
     sh->line_pos = sh->line_len;
+}
+
+static void history_search_reset(void) {
+    Shell *sh = shell_get();
+    if (sh->hist_search) {
+        free(sh->hist_search);
+        sh->hist_search = NULL;
+    }
+    sh->hist_pos = sh->nhist;
 }
 
 /* tab completion — basic filename completion */
@@ -513,6 +758,87 @@ done:
     free(file_part);
 }
 
+/* ================================================================
+ *  CTRL-R — incremental reverse history search (zsh/readline)
+ * ================================================================ */
+static int reverse_search(void) {
+    Shell *sh = shell_get();
+    char pattern[MAX_LINE] = "";
+    int plen = 0;
+    char *saved = sh_strdup(sh->line_buf);
+    int cur = sh->nhist;      /* current match index */
+    static char buf[131072];
+
+    for (;;) {
+        /* find the newest entry containing the pattern */
+        cur = sh->nhist;
+        if (plen > 0) {
+            for (int i = sh->nhist - 1; i >= 0; i--) {
+                if (strstr(sh->history[i], pattern)) { cur = i; break; }
+            }
+        }
+
+        int pos = 0;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "\r\x1b[K\x1b[1;36m(reverse-i-search)`%s'\x1b[0m: ",
+                        pattern);
+        if (cur < sh->nhist)
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%s", sh->history[cur]);
+        else
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "%s", saved);
+        write(sh->term_fd, buf, pos);
+
+        int key = read_key();
+
+        if (key == '\r' || key == '\n') {       /* accept */
+            write(sh->term_fd, "\r\n", 2);
+            if (cur < sh->nhist) {
+                strncpy(sh->line_buf, sh->history[cur], sh->line_cap - 1);
+            } else {
+                strncpy(sh->line_buf, saved, sh->line_cap - 1);
+            }
+            sh->line_len = strlen(sh->line_buf);
+            sh->line_pos = sh->line_len;
+            free(saved);
+            return 1;
+        }
+        if (key == 7 || key == 3 || key == 27) {/* Ctrl-G/Ctrl-C/ESC: cancel */
+            strncpy(sh->line_buf, saved, sh->line_cap - 1);
+            sh->line_len = strlen(saved);
+            sh->line_pos = sh->line_len;
+            free(saved);
+            line_refresh();
+            return 0;
+        }
+        if (key == 18) {                        /* Ctrl-R: previous match */
+            if (plen > 0) {
+                for (int i = cur - 1; i >= 0; i--) {
+                    if (strstr(sh->history[i], pattern)) { cur = i; break; }
+                }
+            }
+            continue;
+        }
+        if (key == 127 || key == 8 || key == '\b') { /* backspace */
+            if (plen > 0) pattern[--plen] = '\0';
+            else {                              /* empty → cancel */
+                strncpy(sh->line_buf, saved, sh->line_cap - 1);
+                sh->line_len = strlen(saved);
+                sh->line_pos = sh->line_len;
+                free(saved);
+                line_refresh();
+                return 0;
+            }
+            continue;
+        }
+        if (key >= 32 && key < 127) {           /* printable */
+            if (plen < (int)sizeof(pattern) - 1)
+                pattern[plen++] = (char)key;
+            pattern[plen] = '\0';
+            continue;
+        }
+    }
+}
+
 /* main line-editor loop — returns a malloc'd line, or NULL on EOF */
 static char *read_line(void) {
     Shell *sh = shell_get();
@@ -526,16 +852,15 @@ static char *read_line(void) {
     sh->line_len = 0;
     sh->line_pos = 0;
     sh->hist_pos = sh->nhist;
+    history_search_reset();
 
     /* allocate history temp slot */
     if (sh->nhist >= sh->hist_cap) {
         sh->hist_cap = sh->hist_cap ? sh->hist_cap * 2 : MAX_HISTORY;
         sh->history = sh_realloc(sh->history, (sh->hist_cap + 1) * sizeof(char *));
     }
-    /* temporary slot at history[nhist] for saving current line */
-    if (sh->history[sh->nhist] == NULL || sh->hist_pos != sh->nhist) {
-        /* ensure we have buffer space */
-    }
+    /* temporary slot at history[nhist] for saving the line being browsed */
+    sh->history[sh->nhist] = NULL;
 
     line_refresh();
 
@@ -547,6 +872,11 @@ static char *read_line(void) {
         case '\r': case '\n':  /* Enter */
             write(sh->term_fd, "\r\n", 2);
             sh->line_buf[sh->line_len] = '\0';
+            /* fish: expand an abbreviation at the end of the line */
+            if (sh->line_len > 0 && abbr_expand_at_cursor()) {
+                sh->line_buf[sh->line_len] = '\0';
+            }
+            history_search_reset();
             /* add to history */
             if (sh->line_len > 0) {
                 if (sh->nhist >= sh->hist_cap) {
@@ -572,6 +902,11 @@ static char *read_line(void) {
             line_refresh();
             break;
 
+        case 18:  /* Ctrl-R — incremental reverse history search */
+            reverse_search();
+            line_refresh();
+            break;
+
         case 1:   /* Ctrl-A — beginning of line */
             sh->line_pos = 0;
             line_refresh();
@@ -586,8 +921,12 @@ static char *read_line(void) {
             if (sh->line_pos > 0) { sh->line_pos--; line_refresh(); }
             break;
 
-        case 6:   /* Ctrl-F — forward one char (right) */
-            if (sh->line_pos < sh->line_len) { sh->line_pos++; line_refresh(); }
+        case 6:   /* Ctrl-F — forward, or accept a suggestion */
+            if (sh->line_pos == sh->line_len)
+                accept_suggestion();
+            else
+                sh->line_pos++;
+            line_refresh();
             break;
 
         case 14:  /* Ctrl-N — next history (down) */
@@ -607,6 +946,7 @@ static char *read_line(void) {
 
         case 21:  /* Ctrl-U — kill to start of line */
             line_kill_to_start();
+            history_search_reset();
             line_refresh();
             break;
 
@@ -623,6 +963,7 @@ static char *read_line(void) {
                     sh->line_pos = p;
                 }
             }
+            history_search_reset();
             line_refresh();
             break;
 
@@ -631,13 +972,18 @@ static char *read_line(void) {
             line_refresh();
             break;
 
-        case '\t':  /* Tab completion */
-            line_complete();
+        case '\t':  /* Tab: accept a suggestion, else complete */
+            if (sh->opt_autosuggest && sh->suggestion) {
+                accept_suggestion();
+            } else {
+                line_complete();
+            }
             line_refresh();
             break;
 
         case 127: case '\b':  /* Backspace */
             line_backspace();
+            history_search_reset();
             line_refresh();
             break;
 
@@ -652,7 +998,11 @@ static char *read_line(void) {
             break;
 
         case 256 + 'C':  /* Right arrow */
-            if (sh->line_pos < sh->line_len) { sh->line_pos++; line_refresh(); }
+            if (sh->line_pos == sh->line_len)
+                accept_suggestion();
+            else
+                sh->line_pos++;
+            line_refresh();
             break;
 
         case 256 + 'D':  /* Left arrow */
@@ -664,19 +1014,25 @@ static char *read_line(void) {
             line_refresh();
             break;
 
-        case 256 + 'F':  /* End */
+        case 256 + 'F':  /* End — also accept a suggestion */
+            accept_suggestion();
             sh->line_pos = sh->line_len;
             line_refresh();
             break;
 
         case 256 + 127:  /* Delete */
             line_delete_at_cursor();
+            history_search_reset();
             line_refresh();
             break;
 
         default:
-            if (key >= 32 && key < 127) {
-                /* printable ASCII */
+            if (key >= 32) {
+                /* printable ASCII and UTF-8 continuation bytes
+                 * (multibyte chars are stored/echoed byte-by-byte) */
+                if (key == ' ')
+                    abbr_expand_at_cursor();
+                history_search_reset();
                 line_insert((char)key);
                 line_refresh();
             }
@@ -735,6 +1091,11 @@ void shell_init(void) {
     sh->opt_noclobber = 0;
     sh->opt_allexport = 0;
     sh->opt_noglob = 0;
+    sh->opt_autocd = 1;            /* fish/zsh: implicit cd */
+    sh->opt_globstar = 1;          /* zsh: '**' recursive glob */
+    sh->opt_autosuggest = 1;       /* fish: history suggestions */
+    sh->opt_syntaxhighlight = 1;   /* fish: colored input */
+    sh->opt_histignoredups = 1;    /* skip consecutive duplicates */
 
     getcwd(sh->cwd, sizeof(sh->cwd));
     snprintf(sh->prompt, sizeof(sh->prompt), "\x1b[1;32mbesh\x1b[0m:\x1b[1;34m\\W\x1b[0m$ ");
@@ -787,6 +1148,17 @@ void shell_init(void) {
     sh->aliases = sh_malloc(sh->aliases_cap * sizeof(Alias));
     sh->naliases = 0;
 
+    /* abbreviation storage */
+    sh->abbrs_cap = 64;
+    sh->abbrs = sh_malloc(sh->abbrs_cap * sizeof(Alias));
+    sh->nabbrs = 0;
+
+    /* directory stack */
+    sh->dirs_cap = 16;
+    sh->dirs = sh_malloc(sh->dirs_cap * sizeof(char *));
+    sh->ndirs = 0;
+    dirs_push(sh->cwd);   /* entry 0 is always the current directory */
+
     /* function storage */
     sh->funcs_cap = 64;
     sh->funcs = sh_malloc(sh->funcs_cap * sizeof(Function));
@@ -821,6 +1193,18 @@ void shell_destroy(void) {
         free(sh->aliases[i].value);
     }
     free(sh->aliases);
+    /* free abbreviations */
+    for (int i = 0; i < sh->nabbrs; i++) {
+        free(sh->abbrs[i].name);
+        free(sh->abbrs[i].value);
+    }
+    free(sh->abbrs);
+    /* free directory stack */
+    for (int i = 0; i < sh->ndirs; i++)
+        free(sh->dirs[i]);
+    free(sh->dirs);
+    free(sh->hist_search);
+    free(sh->suggestion);
     /* free functions */
     for (int i = 0; i < sh->nfuncs; i++) {
         free(sh->funcs[i].name);
@@ -832,24 +1216,169 @@ void shell_destroy(void) {
     /* job list handled async */
 }
 
-/* ---- prompt builder ------------------------------------------ */
-static void build_prompt(void) {
-    Shell *sh = shell_get();
-    char host[HOST_NAME_MAX + 1] = "localhost";
-    char *user = sh_getenv("USER");
-    if (!user) user = "unknown";
-    gethostname(host, sizeof(host));
-    char *h = strchr(host, '.');
-    if (h) *h = '\0';
+/* ---- prompt builder (bash PS1 + zsh prompt escapes) ---------- */
+/* returns a malloc'd git branch name, or NULL when not in a repo */
+static char *get_git_branch(void) {
+    char dir[MAX_PATH];
+    if (!getcwd(dir, sizeof(dir))) return NULL;
 
-    /* get basename of cwd */
+    for (;;) {
+        struct stat st;
+        char gitdir[MAX_PATH + 32];
+        snprintf(gitdir, sizeof(gitdir), "%s/.git", dir);
+        if (stat(gitdir, &st) == 0) {
+            char head[MAX_PATH + 32];
+            snprintf(head, sizeof(head), "%s/HEAD", gitdir);
+            FILE *f = fopen(head, "r");
+            if (!f) return NULL;
+            char line[512];
+            if (!fgets(line, sizeof(line), f)) { fclose(f); return NULL; }
+            fclose(f);
+            char *ref = strstr(line, "refs/heads/");
+            if (ref) {
+                ref += strlen("refs/heads/");
+                char *nl = strchr(ref, '\n');
+                if (nl) *nl = '\0';
+                if (*ref) return sh_strdup(ref);
+            }
+            return sh_strdup("(detached)");
+        }
+        /* go up one level */
+        char *s = strrchr(dir, '/');
+        if (!s) break;
+        if (s == dir) {
+            dir[1] = '\0';   /* at the filesystem root */
+            if (strlen(dir) > 0 && s == dir && dir[1] == '\0') break;
+        } else {
+            *s = '\0';
+        }
+        if (dir[0] == '\0' || (dir[1] == '\0' && dir[0] == '/')) break;
+    }
+    return NULL;
+}
+
+/* zsh-style prompt escapes:
+ *   %n user, %m short host, %M full host, %~ cwd w/ ~, %d full cwd,
+ *   %# '#' if root else '%', %? last exit status (when nonzero),
+ *   %g git branch (when in a repo), %h history line number
+ * bash-style: \u \h \W \w \$ \t \# \n \e */
+static void prompt_render(const char *fmt, char *out, size_t outsz) {
+    Shell *sh = shell_get();
+    char host[HOST_NAME_MAX + 1] = "";
+    char fqdn[HOST_NAME_MAX + 1] = "";
+    gethostname(fqdn, sizeof(fqdn));
+    snprintf(host, sizeof(host), "%s", fqdn);
+    char *dot = strchr(host, '.');
+    if (dot) *dot = '\0';
+
+    const char *user = sh_getenv("USER");
+    if (!user) user = "besh";
+    int root = (geteuid() == 0);
+
     const char *cwd = sh->cwd;
+    char tilde_cwd[MAX_PATH] = "";
+    const char *home = sh_getenv("HOME");
+    if (home && strncmp(cwd, home, strlen(home)) == 0 &&
+        (cwd[strlen(home)] == '/' || cwd[strlen(home)] == '\0')) {
+        snprintf(tilde_cwd, sizeof(tilde_cwd), "~%s", cwd + strlen(home));
+    } else {
+        snprintf(tilde_cwd, sizeof(tilde_cwd), "%s", cwd);
+    }
+
     const char *base = strrchr(cwd, '/');
     if (base && base[1]) base++; else base = cwd;
 
-    snprintf(sh->prompt, sizeof(sh->prompt),
-             "\x1b[1;32m%s@%s\x1b[0m:\x1b[1;34m%s\x1b[0m$ ",
-             user, host, base);
+    char branch[256] = "";
+    char *gb = get_git_branch();
+    if (gb) {
+        snprintf(branch, sizeof(branch), "\x1b[1;33m ( %s )\x1b[0m", gb);
+        free(gb);
+    }
+
+    int o = 0;
+    for (const char *p = fmt; *p && o < (int)outsz - 64; p++) {
+        if (*p == '%') {
+            char n = *(p + 1);
+            switch (n) {
+            case 'n': o += snprintf(out+o, outsz-o, "%s", user); p++; continue;
+            case 'm': o += snprintf(out+o, outsz-o, "%s", host); p++; continue;
+            case 'M': o += snprintf(out+o, outsz-o, "%s", fqdn); p++; continue;
+            case '~': o += snprintf(out+o, outsz-o, "%s", tilde_cwd); p++; continue;
+            case 'd': o += snprintf(out+o, outsz-o, "%s", cwd); p++; continue;
+            case '#':
+                o += snprintf(out+o, outsz-o, "%c", root ? '#' : '%');
+                p++; continue;
+            case '?':
+                if (sh->exit_status != 0)
+                    o += snprintf(out+o, outsz-o, "\x1b[1;31m %d\x1b[0m",
+                                  sh->exit_status);
+                p++; continue;
+            case 'g':
+                o += snprintf(out+o, outsz-o, "%s", branch); p++; continue;
+            case 'h':
+                o += snprintf(out+o, outsz-o, "%d", sh->nhist + 1);
+                p++; continue;
+            case '%': o += snprintf(out+o, outsz-o, "%%"); p++; continue;
+            case '\0': out[o++] = '%'; p--; continue;
+            default:
+                out[o++] = '%'; continue;
+            }
+        }
+        if (*p == '\\') {
+            char n = *(p + 1);
+            switch (n) {
+            case 'u': o += snprintf(out+o, outsz-o, "%s", user); p++; continue;
+            case 'h': o += snprintf(out+o, outsz-o, "%s", host); p++; continue;
+            case 'W': o += snprintf(out+o, outsz-o, "%s", base); p++; continue;
+            case 'w': o += snprintf(out+o, outsz-o, "%s", tilde_cwd); p++; continue;
+            case 't':
+                { char t[16]; time_t now = time(NULL);
+                  strftime(t, sizeof(t), "%H:%M:%S", localtime(&now));
+                  o += snprintf(out+o, outsz-o, "%s", t); }
+                p++; continue;
+            case '$': o += snprintf(out+o, outsz-o, "%c", root ? '#' : '$');
+                p++; continue;
+            case '#': o += snprintf(out+o, outsz-o, "%d", sh->nhist + 1);
+                p++; continue;
+            case 'n': o += snprintf(out+o, outsz-o, "\n"); p++; continue;
+            case 'e': o += snprintf(out+o, outsz-o, "\x1b"); p++; continue;
+            case '\\': out[o++] = '\\'; p++; continue;
+            case '\0': out[o++] = '\\'; p--; continue;
+            default: out[o++] = '\\'; continue;
+            }
+        }
+        out[o++] = *p;
+    }
+    out[o] = '\0';
+}
+
+static void build_prompt(void) {
+    Shell *sh = shell_get();
+    const char *fmt = sh_getenv("PROMPT");
+    if (!fmt || !*fmt) fmt = sh_getenv("PS1");
+    if (!fmt || !*fmt)
+        fmt = "\x1b[1;32mbesh\x1b[0m \x1b[1;36m%~\x1b[0m%g\x1b[0m%?%# ";
+    prompt_render(fmt, sh->prompt, sizeof(sh->prompt));
+}
+
+/* ---- run the startup file (~/.beshrc), if present ------------- */
+static void source_rc(void) {
+    const char *home = sh_getenv("HOME");
+    if (!home) return;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/.beshrc", home);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char buf[MAX_LINE];
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
+            buf[--len] = '\0';
+        if (len > 0 && buf[0] != '#')
+            execute_string(buf);
+    }
+    fclose(f);
 }
 
 /* ================================================================
@@ -938,9 +1467,15 @@ int main(int argc, char **argv) {
            "╚══════════════════════════════════════════════╝\n"
            "\x1b[0m");
 
+    source_rc();   /* load ~/.beshrc (aliases, abbrs, setopt, PROMPT) */
+
     while (sh->running) {
         /* check for completed background jobs */
         job_notify();
+
+        /* full-screen apps (vim/less) restore the tty to canonical mode
+         * when they exit — re-enter raw mode for the line editor */
+        term_raw();
 
         build_prompt();
         char *line = read_line();

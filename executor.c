@@ -143,11 +143,17 @@ void job_notify(void) {
 static int wait_for_pid(pid_t pid) {
     int status;
     pid_t w;
+    sigchld_block();
     do {
         w = waitpid(pid, &status, WUNTRACED);
     } while (w < 0 && errno == EINTR);
+    sigchld_unblock();
 
     if (w < 0) {
+        if (errno == ECHILD) {
+            /* already reaped by the SIGCHLD handler — treat as success */
+            return 0;
+        }
         perror("besh: waitpid");
         return 1;
     }
@@ -272,23 +278,27 @@ int execute_command(ASTNode *node) {
     if (!node || node->type != NODE_COMMAND) return 1;
     if (node->argc == 0) return 0;
 
-    /* ---- expand variables in all arguments ---- */
-    char **expanded_argv = sh_malloc((node->argc + 1) * sizeof(char *));
-    for (int i = 0; i < node->argc; i++) {
-        expanded_argv[i] = expand_string(node->argv[i]);
-    }
-    expanded_argv[node->argc] = NULL;
+    /* ---- expand variables, braces and globs in all arguments ---- */
+    int expanded_argc = node->argc;
+    char **words = sh_malloc((node->argc + 1) * sizeof(char *));
+    for (int i = 0; i < node->argc; i++)
+        words[i] = sh_strdup(node->argv[i]);
+    words[node->argc] = NULL;
+
+    char **expanded_argv = expand_words(words, &expanded_argc);
+    for (int i = 0; i < node->argc; i++) free(words[i]);
+    free(words);
 
     Shell *sh = shell_get();
 
     /* ---- detect leading variable assignments (NAME=value ...) ---- */
     int n_assign = 0;
-    while (n_assign < node->argc && is_assignment(expanded_argv[n_assign]))
+    while (n_assign < expanded_argc && is_assignment(expanded_argv[n_assign]))
         n_assign++;
 
     int cmd_start = n_assign;  /* index of first non-assignment word */
 
-    if (n_assign == node->argc) {
+    if (n_assign == expanded_argc) {
         /* all words are assignments — set shell variables */
         int ret = 0;
         for (int i = 0; i < n_assign; i++) {
@@ -298,7 +308,7 @@ int execute_command(ASTNode *node) {
             *eq = '=';
         }
         sh->exit_status = ret;
-        for (int j = 0; j < node->argc; j++) free(expanded_argv[j]);
+        for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
         free(expanded_argv);
         return ret;
     }
@@ -315,7 +325,7 @@ int execute_command(ASTNode *node) {
 
     /* ---- effective argv starts after assignments ---- */
     char **cmd_argv = expanded_argv + cmd_start;
-    int cmd_argc = node->argc - cmd_start;
+    int cmd_argc = expanded_argc - cmd_start;
 
     /* first, check if it's a shell function */
     for (int i = 0; i < sh->nfuncs; i++) {
@@ -338,8 +348,9 @@ int execute_command(ASTNode *node) {
             int ret = execute_node_internal(sh->funcs[i].body,
                                             NULL, NULL, 0);
 
-            /* free function positional parameters */
-            for (int j = 0; j < fnargs; j++)
+            /* free function positional parameters
+             * (shift may have consumed some of them) */
+            for (int j = 0; j < sh->npositional; j++)
                 free(sh->positional[j]);
             free(sh->positional);
 
@@ -357,7 +368,7 @@ int execute_command(ASTNode *node) {
                 else unsetenv(expanded_argv[i2]);
                 *eq = '=';
             }
-            for (int j = 0; j < node->argc; j++) free(expanded_argv[j]);
+            for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
             free(expanded_argv);
             return ret;
         }
@@ -422,16 +433,38 @@ int execute_command(ASTNode *node) {
         }
 
         sh->exit_status = ret;
-        for (int j = 0; j < node->argc; j++) free(expanded_argv[j]);
+        for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
         free(expanded_argv);
         return ret;
+    }
+
+    /* autocd (fish/zsh): typing a directory name changes into it */
+    if (sh->opt_autocd && cmd_argv[0][0] != '/' && strchr(cmd_argv[0], '/') == NULL &&
+        !resolve_path(cmd_argv[0])) {
+        struct stat st;
+        if (stat(cmd_argv[0], &st) == 0 && S_ISDIR(st.st_mode)) {
+            int r = cd_to(cmd_argv[0]);
+            /* restore env from prefix assignments */
+            for (int i2 = 0; i2 < n_assign; i2++) {
+                char *eq = strchr(expanded_argv[i2], '=');
+                *eq = '\0';
+                char *old = sh_getenv(expanded_argv[i2]);
+                if (old) setenv(expanded_argv[i2], old, 1);
+                else unsetenv(expanded_argv[i2]);
+                *eq = '=';
+            }
+            for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
+            free(expanded_argv);
+            sh->exit_status = r;
+            return r;
+        }
     }
 
     /* external command — fork and exec */
     pid_t pid = fork();
     if (pid < 0) {
         perror("besh: fork");
-        for (int j = 0; j < node->argc; j++) free(expanded_argv[j]);
+        for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
         free(expanded_argv);
         return 1;
     }
@@ -480,7 +513,7 @@ int execute_command(ASTNode *node) {
     }
 
     sh->exit_status = ret;
-    for (int j = 0; j < node->argc; j++) free(expanded_argv[j]);
+    for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
     free(expanded_argv);
     return ret;
 }
@@ -549,15 +582,28 @@ int execute_pipeline(ASTNode *pipeline) {
 
             /* execute the command */
             if (cmds[i]->type == NODE_COMMAND && cmds[i]->argc > 0) {
-                builtin_fn bf = builtin_lookup(cmds[i]->argv[0]);
+                /* expand variables / globs in the pipeline child */
+                int wc = cmds[i]->argc;
+                char **w = sh_malloc((cmds[i]->argc + 1) * sizeof(char *));
+                for (int a = 0; a < cmds[i]->argc; a++)
+                    w[a] = sh_strdup(cmds[i]->argv[a]);
+                w[cmds[i]->argc] = NULL;
+                char **ex = expand_words(w, &wc);
+                for (int a = 0; a < cmds[i]->argc; a++) free(w[a]);
+                free(w);
+
+                builtin_fn bf = builtin_lookup(ex[0]);
                 if (bf) {
-                    int r = bf(cmds[i]->argc, cmds[i]->argv);
+                    int r = bf(wc, ex);
+                    for (int a = 0; a < wc; a++) free(ex[a]);
+                    free(ex);
+                    fflush(NULL);   /* _exit skips stdio flush */
                     _exit(r);
                 }
-                char *path = resolve_path(cmds[i]->argv[0]);
-                if (!path) path = cmds[i]->argv[0];
-                execvp(path, cmds[i]->argv);
-                fprintf(stderr, "besh: %s: %s\n", cmds[i]->argv[0], strerror(errno));
+                char *path = resolve_path(ex[0]);
+                if (!path) path = ex[0];
+                execvp(path, ex);
+                fprintf(stderr, "besh: %s: %s\n", ex[0], strerror(errno));
                 _exit(127);
             }
             _exit(0);

@@ -24,6 +24,8 @@
 #include <pwd.h>
 #include <setjmp.h>
 #include <sys/times.h>
+#include <time.h>
+#include <stddef.h>
 
 /* -------------------------------------------------------------------
  *  Constants
@@ -210,6 +212,16 @@ typedef struct Shell {
     int          naliases;
     int          aliases_cap;
 
+    /* abbreviations (fish-style, expand on space/enter) */
+    Alias       *abbrs;
+    int          nabbrs;
+    int          abbrs_cap;
+
+    /* directory stack (zsh-style pushd/popd/dirs) */
+    char       **dirs;
+    int          ndirs;
+    int          dirs_cap;
+
     /* functions */
     Function    *funcs;
     int          nfuncs;
@@ -237,21 +249,28 @@ typedef struct Shell {
     int          exit_status;   /* $?                             */
     int          running;
     char         cwd[MAX_PATH];
-    char         prompt[256];
+    char         prompt[8192];
     int          linenum;
 
-    /* options (set -o / +o, shopt) */
+    /* options (set -o / +o, shopt, setopt) */
     int          opt_noclobber;  /* >| needed to overwrite        */
     int          opt_allexport;  /* auto-export all vars          */
     int          opt_xtrace;     /* set -x: print commands        */
     int          opt_verbose;    /* set -v: print input           */
     int          opt_noglob;     /* set -f: disable globbing      */
+    int          opt_autocd;     /* zsh/fish: type a dir to cd    */
+    int          opt_globstar;   /* zsh: '**' recursive glob      */
+    int          opt_autosuggest;/* fish: history autosuggestion  */
+    int          opt_syntaxhighlight; /* fish: colored input      */
+    int          opt_histignoredups;  /* skip duplicate history   */
 
     /* line-editor state */
     char        *line_buf;
     int          line_len;
     int          line_cap;
     int          line_pos;       /* cursor position in buffer     */
+    char        *hist_search;    /* prefix for up-arrow search     */
+    char        *suggestion;     /* autosuggestion suffix (0=none) */
 
     /* positional parameters ($1, $2, ...) */
     char       **positional;
@@ -330,10 +349,25 @@ int  builtin_shift(int argc, char **argv);
 int  builtin_times(int argc, char **argv);
 int  builtin_trap(int argc, char **argv);
 int  builtin_umask(int argc, char **argv);
+int  builtin_abbr(int argc, char **argv);
+int  builtin_pushd(int argc, char **argv);
+int  builtin_popd(int argc, char **argv);
+int  builtin_dirs(int argc, char **argv);
+int  builtin_setopt(int argc, char **argv);
+int  builtin_unsetopt(int argc, char **argv);
+int  builtin_readonly(int argc, char **argv);
 
 typedef int (*builtin_fn)(int, char **);
 builtin_fn builtin_lookup(const char *name);
 int        builtin_is(const char *name);
+
+/* --- cd / directory stack helpers --- */
+int  cd_to(const char *dir);
+void dirs_push(const char *dir);
+void dirs_print(int verbose);
+void abbr_add(const char *name, const char *value);
+char *abbr_find(const char *name);
+int  abbr_erase(const char *name);
 
 /* -------------------------------------------------------------------
  *  expand.c
@@ -342,6 +376,7 @@ char  *expand_string(const char *str);
 char **expand_words(char **words, int *count);
 char  *tilde_expand(const char *str);
 char **glob_expand(const char *pattern, int *count);
+char **brace_expand(const char *str, int *count);
 char  *var_expand(const char *name);
 
 /* -------------------------------------------------------------------
@@ -351,6 +386,8 @@ void signals_setup(void);
 void signals_restore(void);
 void signals_block(void);
 void signals_unblock(void);
+void sigchld_block(void);
+void sigchld_unblock(void);
 
 /* -------------------------------------------------------------------
  *  job control (in executor.c)

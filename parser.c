@@ -468,13 +468,8 @@ static ASTNode *parse_list(Lexer *l) {
         int tok = l->token_type;
         lexer_next(l);
 
-        /* trailing separator — ignore */
-        if (l->token_type == TOK_EOF || l->token_type == TOK_RPAREN ||
-            l->token_type == TOK_DSEMI || is_clause_terminator(l))
-            break;
-
         if (tok == TOK_BG) {
-            /* background the left child */
+            /* background the left child — even at end of input */
             ASTNode *bg = ast_new(NODE_BG);
             bg->left = left;
             left = bg;
@@ -488,16 +483,22 @@ static ASTNode *parse_list(Lexer *l) {
                 list->right = right;
                 left = list;
             }
-        } else {
-            /* ; or newline — sequential execution */
-            if (l->token_type != TOK_EOF && l->token_type != TOK_RPAREN &&
-                l->token_type != TOK_DSEMI && !is_clause_terminator(l)) {
-                ASTNode *right = parse_and_or(l);
-                ASTNode *list = ast_new(NODE_LIST);
-                list->left = left;
-                list->right = right;
-                left = list;
-            }
+            continue;
+        }
+
+        /* trailing separator — ignore */
+        if (l->token_type == TOK_EOF || l->token_type == TOK_RPAREN ||
+            l->token_type == TOK_DSEMI || is_clause_terminator(l))
+            break;
+
+        /* ; or newline — sequential execution */
+        if (l->token_type != TOK_EOF && l->token_type != TOK_RPAREN &&
+            l->token_type != TOK_DSEMI && !is_clause_terminator(l)) {
+            ASTNode *right = parse_and_or(l);
+            ASTNode *list = ast_new(NODE_LIST);
+            list->left = left;
+            list->right = right;
+            left = list;
         }
     }
 

@@ -5,11 +5,11 @@ import { useReducedMotion } from "@/app/hooks/useReducedMotion";
 interface Stat { label: string; value: number; suffix: string; }
 
 const STATS: Stat[] = [
-  { label: "Lines of C", value: 3400, suffix: "" },
-  { label: "Builtins", value: 29, suffix: "" },
+  { label: "Lines of C", value: 6116, suffix: "" },
+  { label: "Builtins", value: 38, suffix: "" },
   { label: "Tokens/sec", value: 98420, suffix: "" },
   { label: "Parse Speed", value: 1.2, suffix: "ms" },
-  { label: "Binary Size", value: 156, suffix: "KB" },
+  { label: "Binary Size", value: 345, suffix: "KB" },
   { label: "Dependencies", value: 0, suffix: "" },
 ];
 

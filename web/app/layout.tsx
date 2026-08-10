@@ -4,11 +4,11 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "besh — Cyber Shell",
-  description: "besh: a bash-compatible Unix shell written in C. Full-featured shell with job control, line editing, pipelines, redirections, and 29 built-in commands.",
-  keywords: ["shell", "bash", "unix", "terminal", "c", "cyberpunk"],
+  description: "besh: a bash-compatible shell written in C with fish & zsh features — autosuggestions, syntax highlighting, abbr, globstar, brace expansion, and 38 built-in commands.",
+  keywords: ["shell", "bash", "zsh", "fish", "unix", "terminal", "c", "autosuggestions", "syntax highlighting", "cyberpunk"],
   openGraph: {
     title: "besh — Cyber Shell",
-    description: "A bash-compatible shell written in C",
+    description: "A bash-compatible shell in C with fish & zsh features",
   },
 };
 

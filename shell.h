@@ -199,6 +199,18 @@ typedef struct Function {
 } Function;
 
 /* -------------------------------------------------------------------
+ *  Programmable completion spec  (complete builtin)
+ *  Stored as a linked list on the Shell — never a fixed global array.
+ * ------------------------------------------------------------------- */
+typedef struct CompSpec {
+    char            *name;      /* command name the rule applies to   */
+    char            *wordlist;  /* -W 'list'                          */
+    char            *func;      /* -F funcname                        */
+    char            *action;    /* -A type (command/builtin/file/...) */
+    struct CompSpec *next;
+} CompSpec;
+
+/* -------------------------------------------------------------------
  *  Global shell state
  * ------------------------------------------------------------------- */
 typedef struct Shell {
@@ -233,6 +245,12 @@ typedef struct Shell {
     int          hist_cap;
     int          hist_pos;      /* cursor in history browse      */
     char        *hist_file;
+    long        *hist_time;     /* parallel epoch-second stamps  */
+    int          hist_time_cap;
+    int          hist_written;  /* entries already written to file */
+
+    /* programmable completion rules */
+    CompSpec    *compspecs;
 
     /* job control */
     Job         *jobs;
@@ -338,6 +356,9 @@ int  builtin_jobs(int argc, char **argv);
 int  builtin_fg(int argc, char **argv);
 int  builtin_bg(int argc, char **argv);
 int  builtin_history(int argc, char **argv);
+int  builtin_fc(int argc, char **argv);
+int  builtin_compgen(int argc, char **argv);
+int  builtin_complete(int argc, char **argv);
 int  builtin_set(int argc, char **argv);
 int  builtin_read(int argc, char **argv);
 int  builtin_test(int argc, char **argv);
@@ -380,6 +401,8 @@ char  *tilde_expand(const char *str);
 char **glob_expand(const char *pattern, int *count);
 char **brace_expand(const char *str, int *count);
 char  *var_expand(const char *name);
+/* glob-style pattern match used by ${var#pat}, case, [[ a == pat ]] */
+int    sh_pattern_match(const char *str, const char *pattern);
 
 /* -------------------------------------------------------------------
  *  signal.c  (parts in main.c)
@@ -419,5 +442,26 @@ void   sh_unsetenv(const char *name);
 char  *resolve_path(const char *cmd);
 void   history_save(void);
 void   history_load(void);
+
+/* --- history helpers (implemented in main.c) --- */
+void history_add(const char *line);      /* add (respect dups/HISTSIZE)  */
+void history_clear(void);                /* history -c                   */
+int  history_delete(int idx);            /* history -d (0-based index)    */
+void history_append(void);               /* history -a                   */
+void history_read(void);                 /* history -r                   */
+void history_write(void);                /* history -w                   */
+
+/* --- programmable completion (implemented in builtins.c) --- */
+CompSpec   *compspec_find(const char *name);
+int         compspec_add(const char *name, const char *wordlist,
+                         const char *func, const char *action);
+int         compspec_remove(const char *name);
+void        compspec_free_all(void);
+int         compgen_generate(const char *action, const char *wordlist,
+                             const char *func, const char *prefix,
+                             char ***out, int *n);
+void        compgen_free(char **matches, int n);
+int         builtin_count(void);
+const char *builtin_name(int i);
 
 #endif /* SHELL_H */

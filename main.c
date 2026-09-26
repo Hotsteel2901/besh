@@ -223,6 +223,92 @@ void sigchld_unblock(void) {
 }
 
 /* ================================================================
+ *  UTF-8 aware helpers
+ *  - utf8_decode : one code point + number of bytes consumed
+ *  - cp_width    : terminal display width (1 / 2 / 0)
+ *  - index helpers so every edit acts on whole characters
+ * ================================================================ */
+typedef struct { int lo, hi; } URange;
+
+/* East-Asian Wide / Fullwidth code points → width 2 */
+static const URange width2_ranges[] = {
+    {0x1100, 0x115F}, {0x2329, 0x232A}, {0x2E80, 0x303E},
+    {0x3041, 0x33FF}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF},
+    {0xA000, 0xA4CF}, {0xAC00, 0xD7A3}, {0xF900, 0xFAFF},
+    {0xFE10, 0xFE19}, {0xFE30, 0xFE6F}, {0xFF01, 0xFF60},
+    {0xFFE0, 0xFFE6}, {0x1F300, 0x1F64F}, {0x1F900, 0x1F9FF},
+    {0x20000, 0x2FFFD}, {0x30000, 0x3FFFD},
+};
+/* combining marks / zero-width → width 0 */
+static const URange width0_ranges[] = {
+    {0x0300, 0x036F}, {0x0483, 0x0489}, {0x0591, 0x05BD},
+    {0x0610, 0x061A}, {0x064B, 0x065F}, {0x1AB0, 0x1AFF},
+    {0x1DC0, 0x1DFF}, {0x20D0, 0x20FF}, {0xFE00, 0xFE0F},
+    {0xFE20, 0xFE2F}, {0x200B, 0x200F},
+};
+
+static int in_ranges(const URange *r, int n, int cp) {
+    for (int i = 0; i < n; i++)
+        if (cp >= r[i].lo && cp <= r[i].hi) return 1;
+    return 0;
+}
+
+static int utf8_decode(const char *s, int *cp) {
+    unsigned char c = (unsigned char)s[0];
+    if (c < 0x80) { *cp = c; return 1; }
+    int n, v;
+    if      ((c & 0xE0) == 0xC0) { n = 2; v = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { n = 3; v = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { n = 4; v = c & 0x07; }
+    else { *cp = c; return 1; }                 /* invalid byte */
+    for (int i = 1; i < n; i++) {
+        unsigned char cc = (unsigned char)s[i];
+        if ((cc & 0xC0) != 0x80) { *cp = c; return 1; }   /* truncated */
+        v = (v << 6) | (cc & 0x3F);
+    }
+    *cp = v;
+    return n;
+}
+
+static int cp_width(int cp) {
+    if (cp < 32) return 0;
+    if (in_ranges(width0_ranges, (int)(sizeof(width0_ranges)/sizeof(URange)), cp))
+        return 0;
+    if (in_ranges(width2_ranges, (int)(sizeof(width2_ranges)/sizeof(URange)), cp))
+        return 2;
+    return 1;
+}
+
+/* display width of the first `len` bytes of s */
+static int utf8_width(const char *s, int len) {
+    int w = 0, i = 0;
+    while (i < len) {
+        int cp;
+        int n = utf8_decode(s + i, &cp);
+        if (n <= 0) n = 1;
+        w += cp_width(cp);
+        i += n;
+    }
+    return w;
+}
+
+/* start index of the character before byte offset `pos` */
+static int utf8_prev_index(const char *s, int pos) {
+    if (pos <= 0) return 0;
+    int i = pos - 1;
+    while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80) i--;
+    return i;
+}
+
+/* start index of the character after byte offset `pos` */
+static int utf8_next_index(const char *s, int len, int pos) {
+    if (pos >= len) return len;
+    int i = pos + 1;
+    while (i < len && ((unsigned char)s[i] & 0xC0) == 0x80) i++;
+    return i;
+}
+
+/* ================================================================
  *  LINE EDITOR  (readline-style using termios + VT100 escapes)
  * ================================================================ */
 static void term_raw(void) {
@@ -489,15 +575,20 @@ static void line_refresh(void) {
         write(sh->term_fd, sbuf, n);
     }
 
-    /* reposition the cursor using cursor-left escapes */
-    int nleft = sh->line_len - sh->line_pos + sugg;
+    /* reposition the cursor using cursor-left escapes.
+     * The distance is measured in terminal columns (display width),
+     * not bytes, so wide/combining characters line up correctly. */
+    int nleft = utf8_width(sh->line_buf + sh->line_pos,
+                           sh->line_len - sh->line_pos);
+    if (sugg > 0)
+        nleft += utf8_width(sh->suggestion, strlen(sh->suggestion));
     if (nleft > 0) {
         int n = snprintf(buf, sizeof(buf), "\x1b[%dD", nleft);
         write(sh->term_fd, buf, n);
     }
 }
 
-/* insert char at cursor */
+/* insert a byte at cursor */
 static void line_insert(char c) {
     Shell *sh = shell_get();
     if (sh->line_len + 2 >= sh->line_cap) {
@@ -512,26 +603,46 @@ static void line_insert(char c) {
     sh->line_len++;
 }
 
-/* delete char at cursor (Delete key) */
+/* insert a whole (possibly multibyte) character at cursor */
+static void line_insert_str(const char *s, int n) {
+    Shell *sh = shell_get();
+    if (sh->line_len + n + 1 >= sh->line_cap) {
+        while (sh->line_len + n + 1 >= sh->line_cap)
+            sh->line_cap = sh->line_cap ? sh->line_cap * 2 : 1024;
+        sh->line_buf = sh_realloc(sh->line_buf, sh->line_cap);
+    }
+    memmove(sh->line_buf + sh->line_pos + n,
+            sh->line_buf + sh->line_pos,
+            sh->line_len - sh->line_pos + 1);
+    memcpy(sh->line_buf + sh->line_pos, s, n);
+    sh->line_pos += n;
+    sh->line_len += n;
+}
+
+/* delete char at cursor (Delete key) — whole character */
 static void line_delete_at_cursor(void) {
     Shell *sh = shell_get();
     if (sh->line_pos < sh->line_len) {
+        int next = utf8_next_index(sh->line_buf, sh->line_len, sh->line_pos);
+        int n = next - sh->line_pos;
         memmove(sh->line_buf + sh->line_pos,
-                sh->line_buf + sh->line_pos + 1,
-                sh->line_len - sh->line_pos);
-        sh->line_len--;
+                sh->line_buf + next,
+                sh->line_len - next + 1);
+        sh->line_len -= n;
     }
 }
 
-/* backspace */
+/* backspace — delete the whole character before the cursor */
 static void line_backspace(void) {
     Shell *sh = shell_get();
     if (sh->line_pos > 0) {
-        memmove(sh->line_buf + sh->line_pos - 1,
+        int start = utf8_prev_index(sh->line_buf, sh->line_pos);
+        int n = sh->line_pos - start;
+        memmove(sh->line_buf + start,
                 sh->line_buf + sh->line_pos,
                 sh->line_len - sh->line_pos + 1);
-        sh->line_pos--;
-        sh->line_len--;
+        sh->line_pos = start;
+        sh->line_len -= n;
     }
 }
 
@@ -918,14 +1029,17 @@ static char *read_line(void) {
             break;
 
         case 2:   /* Ctrl-B — back one char (left) */
-            if (sh->line_pos > 0) { sh->line_pos--; line_refresh(); }
+            if (sh->line_pos > 0) {
+                sh->line_pos = utf8_prev_index(sh->line_buf, sh->line_pos);
+                line_refresh();
+            }
             break;
 
         case 6:   /* Ctrl-F — forward, or accept a suggestion */
             if (sh->line_pos == sh->line_len)
                 accept_suggestion();
             else
-                sh->line_pos++;
+                sh->line_pos = utf8_next_index(sh->line_buf, sh->line_len, sh->line_pos);
             line_refresh();
             break;
 
@@ -1001,12 +1115,15 @@ static char *read_line(void) {
             if (sh->line_pos == sh->line_len)
                 accept_suggestion();
             else
-                sh->line_pos++;
+                sh->line_pos = utf8_next_index(sh->line_buf, sh->line_len, sh->line_pos);
             line_refresh();
             break;
 
         case 256 + 'D':  /* Left arrow */
-            if (sh->line_pos > 0) { sh->line_pos--; line_refresh(); }
+            if (sh->line_pos > 0) {
+                sh->line_pos = utf8_prev_index(sh->line_buf, sh->line_pos);
+                line_refresh();
+            }
             break;
 
         case 256 + 'H':  /* Home */
@@ -1027,13 +1144,27 @@ static char *read_line(void) {
             break;
 
         default:
-            if (key >= 32) {
-                /* printable ASCII and UTF-8 continuation bytes
-                 * (multibyte chars are stored/echoed byte-by-byte) */
+            if (key >= 32 && key < 256) {
+                /* printable ASCII and the first byte of a UTF-8 char.
+                 * For a multibyte character, read the continuation bytes
+                 * here so the whole code point is inserted atomically. */
                 if (key == ' ')
                     abbr_expand_at_cursor();
                 history_search_reset();
-                line_insert((char)key);
+                unsigned char first = (unsigned char)key;
+                char seq[4];
+                int n = 1;
+                seq[0] = (char)first;
+                int need = 0;
+                if      ((first & 0xE0) == 0xC0) need = 2;
+                else if ((first & 0xF0) == 0xE0) need = 3;
+                else if ((first & 0xF8) == 0xF0) need = 4;
+                while (n < need) {
+                    unsigned char cb;
+                    if (read(sh->term_fd, &cb, 1) != 1) break;
+                    seq[n++] = (char)cb;
+                }
+                line_insert_str(seq, n);
                 line_refresh();
             }
             /* ignore other control chars */

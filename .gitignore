@@ -12,3 +12,10 @@ besh
 node_modules/
 web/.next/
 web/out/
+
+# Crash dumps & editor/OS noise
+core
+core.*
+*.core
+*.swp
+*~

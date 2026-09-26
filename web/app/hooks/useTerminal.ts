@@ -1,7 +1,7 @@
 "use client";
 import { useState, useCallback } from "react";
 
-const BANNER = "besh v1.1.0 — a bash-compatible shell in C, remixed with fish & zsh";
+const BANNER = "besh v1.2.0 — a bash-compatible shell in C, remixed with fish & zsh";
 
 /* A short, honest demo session so the terminal isn't an empty box on load. */
 const DEMO_TRANSCRIPT = [

@@ -1,0 +1,2 @@
+echo x | cat | cat
+echo a b c | tr " " "\n" | sort

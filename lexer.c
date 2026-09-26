@@ -95,6 +95,28 @@ static void lex_emit_dollar_name(Lexer *l, char **buf, int *blen, int *bcap) {
     l->pos = j;
 }
 
+/* Emit the single-character special parameter following `$` ($? $$ $# $!
+ * $* $@ $- $0..$9) verbatim, escaping only the `$` itself.
+ *
+ * These must NOT be fed to the generic "escape every protected character"
+ * path: `?` * is glob-special and would be written as `\?`, which the
+ * parameter-expansion scanner then fails to recognise as the `$?`
+ * parameter — it sees `$` followed by a backslash, takes no name at all,
+ * and the whole thing later unescapes back to a literal `$?`.  Emitting
+ * `$?` untouched keeps the two characters adjacent all the way to the
+ * expansion stage.  Returns 1 when a special parameter was consumed. */
+static int lex_emit_special_param(Lexer *l, char **buf, int *blen, int *bcap) {
+    if (l->pos + 1 >= l->len) return 0;
+    char c = l->input[l->pos + 1];
+    if (c != '?' && c != '$' && c != '#' && c != '!'
+        && c != '*' && c != '@' && c != '-')
+        return 0;
+    lex_append_raw(buf, blen, bcap, '$');
+    lex_append_raw(buf, blen, bcap, c);
+    l->pos += 2;
+    return 1;
+}
+
 /* Copy a whole `$(...)` / `$((...))` substitution verbatim and advance past
  * it.  The text is re-parsed by command substitution later, so it must not
  * be escape-mangled here (quotes and backslashes inside are meaningful). */
@@ -368,7 +390,12 @@ static char *read_double_quoted(Lexer *l) {
             prev_dollar = 0;
             continue;
         }
-        if (c == '$') {                     /* ${...}, $?, $(, ... */
+        /* $? $$ $# $! $* $@ $- — copy the pair, never escape the second */
+        if (c == '$' && lex_emit_special_param(l, &buf, &blen, &bcap)) {
+            prev_dollar = 0;
+            continue;
+        }
+        if (c == '$') {                     /* ${...}, $(, ... */
             lex_append_raw(&buf, &blen, &bcap, '$');
             prev_dollar = 1;
             l->pos++;
@@ -510,6 +537,9 @@ static char *read_word(Lexer *l) {
             lex_emit_dollar_name(l, &buf, &blen, &bcap);
             continue;
         }
+        /* $? $$ $# $! $* $@ $- — copy the pair, never escape the second */
+        if (c == '$' && lex_emit_special_param(l, &buf, &blen, &bcap))
+            continue;
 
         if (blen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
         buf[blen++] = l->input[l->pos++];

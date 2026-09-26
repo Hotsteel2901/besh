@@ -1,0 +1,12 @@
+# command_not_found_handler must receive the entire failed command line
+# as positional parameters and its return status must become $?.
+command_not_found_handler() {
+    echo "cnf: n=$# cmd=$1 arg2=$2" >&2
+    return 127
+}
+nosuchcommand_zzz alpha beta
+echo "status=$?"
+exit 0
+--- expect ---
+cnf: n=3 cmd=nosuchcommand_zzz arg2=alpha
+status=127

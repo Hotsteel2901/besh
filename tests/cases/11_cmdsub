@@ -1,0 +1,2 @@
+echo `echo backtick`
+echo $(echo dollar)

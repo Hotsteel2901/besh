@@ -5,10 +5,11 @@ import { useTerminal } from "@/app/hooks/useTerminal";
 /* Every builtin name registered in builtins.c — used to color the first word
  * green (valid) or rose (unknown), fish-style. */
 const KNOWN_COMMANDS = new Set([
-  "abbr", "alias", "bg", "break", "cd", "continue", "dirs", "echo", "exec",
-  "exit", "export", "false", "fg", "help", "history", "jobs", "popd", "pushd",
-  "pwd", "read", "readonly", "return", "set", "setopt", "shift", "source",
-  "test", "times", "trap", "true", "type", "umask", "unalias", "unset",
+  "abbr", "alias", "bg", "break", "cd", "compgen", "complete", "continue",
+  "declare", "dirs", "echo", "exec", "exit", "export", "false", "fc", "fg",
+  "help", "history", "jobs", "local", "popd", "pushd", "pwd", "read",
+  "readonly", "return", "set", "setopt", "shift", "source", "test", "times",
+  "trap", "true", "type", "typeset", "umask", "unalias", "unset",
   "unsetopt", "wait", "[", ".", "clear", "ls", "cat", "neofetch", "whoami",
   "uname", "uptime", "date", "gp",
 ]);
@@ -106,7 +107,7 @@ export default function Terminal() {
             <span className="font-mono text-xs text-[color:var(--text-2)]">
               besh — zsh-style prompt
             </span>
-            <span className="ml-auto font-mono text-[11px] text-[color:var(--text-3)]">v1.1.0</span>
+            <span className="ml-auto font-mono text-[11px] text-[color:var(--text-3)]">v1.2.0</span>
           </div>
 
           {/* Terminal output */}

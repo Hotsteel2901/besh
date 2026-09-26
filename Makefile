@@ -10,7 +10,7 @@ SRCS    := main.c lexer.c parser.c executor.c builtins.c expand.c
 OBJS    := $(SRCS:.c=.o)
 TARGET  := besh
 
-.PHONY: all clean run test
+.PHONY: all clean run test test-diff test-interactive
 
 all: $(TARGET)
 
@@ -26,51 +26,34 @@ clean:
 run: $(TARGET)
 	./$(TARGET)
 
+# --- tests -----------------------------------------------------------
+# test-diff        24 cases run under both bash and besh; outputs diffed
+# test-interactive interactive line-editor / history / completion checks
+# test             both of the above, plus a few illustrative one-liners
+test-diff: $(TARGET)
+	@tests/run.sh
+
+test-interactive: $(TARGET)
+	@python3 tests/interactive.py
+
 test: $(TARGET)
-	@echo "=== Test 1: Simple command ==="
-	@echo "echo hello world" | ./$(TARGET)
+	@echo "=== Differential suite (bash vs besh) ==="
+	@tests/run.sh
 	@echo ""
-	@echo "=== Test 2: Pipeline ==="
-	@echo "echo hello world | cat" | ./$(TARGET)
+	@echo "=== Interactive suite (line editor, history, completion) ==="
+	@python3 tests/interactive.py
 	@echo ""
-	@echo "=== Test 3: Builtin cd / pwd ==="
-	@echo "cd /tmp && pwd" | ./$(TARGET)
-	@echo ""
-	@echo "=== Test 4: Variable expansion ==="
-	@echo "echo \$$HOME" | ./$(TARGET)
-	@echo ""
-	@echo "=== Test 5: Redirection ==="
-	@echo "echo test > /tmp/besh_test.txt && cat /tmp/besh_test.txt && rm /tmp/besh_test.txt" | ./$(TARGET)
-	@echo ""
-	@echo "=== Test 6: AND/OR ==="
-	@echo "true && echo yes || echo no" | ./$(TARGET)
-	@echo "false && echo yes || echo no" | ./$(TARGET)
-	@echo ""
-	@echo "=== Test 7: Background ==="
-	@echo "sleep 0.1 &" | ./$(TARGET)
-	@echo ""
-	@echo "=== Test 8: History ==="
-	@printf "echo first\necho second\nhistory\n" | ./$(TARGET)
-	@echo ""
-	@echo "=== Test 9: Globbing (globstar) ==="
-	@mkdir -p /tmp/besh_t/a/b && touch /tmp/besh_t/a/1.c /tmp/besh_t/a/b/2.c
-	@echo "cd /tmp/besh_t && echo *.c && echo **/*.c" | ./$(TARGET)
-	@rm -rf /tmp/besh_t
-	@echo ""
-	@echo "=== Test 10: Brace expansion ==="
-	@echo "echo {a,b,c}.txt {1..4}" | ./$(TARGET)
-	@echo ""
-	@echo "=== Test 11: autocd (implicit cd) ==="
-	@mkdir -p /tmp/besh_ac && echo "cd /tmp && besh_ac && pwd" | ./$(TARGET)
-	@rm -rf /tmp/besh_ac
-	@echo ""
-	@echo "=== Test 12: dirs / pushd / popd ==="
-	@echo "dirs && pushd /tmp && popd" | ./$(TARGET)
-	@echo ""
-	@echo "=== Test 13: Functions + shift ==="
-	@printf 'f() { echo "\$$1"; shift; echo "\$$1"; }; f a b c\n' | ./$(TARGET)
-	@echo ""
-	@echo "=== Test 14: setopt / unsetopt ==="
-	@echo "setopt autocd && setopt | grep autocd" | ./$(TARGET)
+	@echo "=== Showcase ==="
+	@echo "--- process substitution ---"
+	@echo 'cat <(echo from-a-psub)' | ./$(TARGET)
+	@echo "--- brace group + compound redirection ---"
+	@echo '{ echo one; echo two; } > /tmp/besh_demo.txt; cat /tmp/besh_demo.txt; rm -f /tmp/besh_demo.txt' | ./$(TARGET)
+	@echo "--- fd duplication (redirect stdout onto stderr) ---"
+	@printf 'echo to-stderr >&2\n' | ./$(TARGET) 2>&1
+	@echo "--- command_not_found_handler ---"
+	@printf 'command_not_found_handler() { echo "hint: run \\"help\\" first" >&2; return 127; }\nno_such_cmd_here\n' | ./$(TARGET) 2>&1 || true
+	@echo "--- programmable completion ---"
+	@echo 'complete -W "alpha beta" demo; complete -p; compgen -W "alpha beta" -- al' | ./$(TARGET)
 	@echo ""
 	@echo "=== All tests done ==="
+

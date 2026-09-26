@@ -1,0 +1,3 @@
+true && echo yes
+false || echo fallback
+false && echo no; echo after

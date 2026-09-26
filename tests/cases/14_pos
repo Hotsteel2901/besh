@@ -1,0 +1,4 @@
+set -- a b c
+echo $# $1 $3
+shift
+echo $# $1

@@ -1,0 +1,32 @@
+name: build & test
+
+on:
+  push:
+    branches: [master, main]
+    paths-ignore:
+      - 'web/**'
+      - '**/*.md'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    paths-ignore:
+      - 'web/**'
+      - '**/*.md'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (warnings are treated as failures)
+        run: |
+          make clean
+          make CFLAGS='-Wall -Wextra -O2 -g -Wno-format-truncation -Werror'
+
+      - name: Differential suite (bash vs besh)
+        run: tests/run.sh
+
+      - name: Interactive suite (pty: line editor, history, completion)
+        run: python3 tests/interactive.py

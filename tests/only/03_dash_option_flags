@@ -1,0 +1,9 @@
+# $- must expand to the current option flags (no escaping of the `-`).
+set -eu
+echo "dash=$-"
+set +e
+echo "dash2=$-"
+exit 0
+--- expect ---
+dash=eu
+dash2=u

@@ -1,0 +1,3 @@
+mkdir -p /tmp/bt/gl/sub
+touch /tmp/bt/gl/1.c /tmp/bt/gl/sub/2.c
+cd /tmp/bt/gl && echo *.c && echo **/*.c

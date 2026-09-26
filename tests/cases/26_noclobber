@@ -1,0 +1,12 @@
+# noclobber blocks `>` onto an existing file but lets `>|` through.
+tmp=/tmp/besh_nc_$$.txt
+echo original > "$tmp"
+set -C
+{ echo blocked > "$tmp"; } 2>/dev/null
+echo "after-blocked=$(cat "$tmp")"
+echo forced >| "$tmp"
+echo "after-clobber=$(cat "$tmp")"
+set +C
+echo back > "$tmp"
+echo "after-restore=$(cat "$tmp")"
+rm -f "$tmp"

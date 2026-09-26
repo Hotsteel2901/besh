@@ -1,0 +1,13 @@
+# $? must expand even inside double quotes (the lexer used to escape the
+# `?` and lose the parameter).
+false
+echo "q1=$?"
+true
+echo "q2=$?"
+(exit 42)
+echo "q3=$?"
+exit 0
+--- expect ---
+q1=1
+q2=0
+q3=42

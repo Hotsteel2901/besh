@@ -1,0 +1,6 @@
+# A handler is optional: without one besh reports the usual 127 error.
+nosuchcommand_qqq 2>/dev/null
+echo "rc=$?"
+exit 0
+--- expect ---
+rc=127

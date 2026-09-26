@@ -1,0 +1,3 @@
+f() { echo "arg:$1 n:$#"; return 3; }
+f x y
+ echo rc=$?

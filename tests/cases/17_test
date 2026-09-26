@@ -1,0 +1,4 @@
+x=1
+test $x -eq 1 && echo eq
+test -f /etc/passwd && echo fileok
+[ -d /tmp ] && echo dirok

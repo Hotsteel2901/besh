@@ -133,6 +133,19 @@ static char *param_get(const char *name, int *is_set) {
         case '?': snprintf(buf, sizeof(buf), "%d", sh->exit_status); return sh_strdup(buf);
         case '$': snprintf(buf, sizeof(buf), "%d", getpid());        return sh_strdup(buf);
         case '#': snprintf(buf, sizeof(buf), "%d", sh->npositional);  return sh_strdup(buf);
+        case '-': {   /* current option flags, bash-compatible ordering */
+            char o[24]; int k = 0;
+            if (sh->opt_errexit)   o[k++] = 'e';
+            if (sh->opt_noglob)    o[k++] = 'f';
+            if (sh->opt_allexport) o[k++] = 'a';
+            if (sh->opt_nounset)   o[k++] = 'u';
+            if (sh->opt_verbose)   o[k++] = 'v';
+            if (sh->opt_xtrace)    o[k++] = 'x';
+            if (sh->job_interactive) o[k++] = 'i';
+            if (sh->opt_noclobber) o[k++] = 'C';
+            o[k] = '\0';
+            return sh_strdup(o);
+        }
         case '!': {
             pid_t lp = 0;
             for (Job *j = sh->jobs; j; j = j->next)
@@ -773,6 +786,21 @@ static char *var_expand_one(const char **pp) {
         *pp = p + 1;
         return sh_strdup(buf);
     }
+    if (*p == '-') {   /* $- — current option flags */
+        char o[24];
+        int k = 0;
+        if (sh->opt_errexit)     o[k++] = 'e';
+        if (sh->opt_noglob)      o[k++] = 'f';
+        if (sh->opt_allexport)   o[k++] = 'a';
+        if (sh->opt_nounset)     o[k++] = 'u';
+        if (sh->opt_verbose)     o[k++] = 'v';
+        if (sh->opt_xtrace)      o[k++] = 'x';
+        if (sh->job_interactive) o[k++] = 'i';
+        if (sh->opt_noclobber)   o[k++] = 'C';
+        o[k] = '\0';
+        *pp = p + 1;
+        return sh_strdup(o);
+    }
     if (*p >= '0' && *p <= '9') {
         int idx = *p - '0';
         *pp = p + 1;
@@ -914,28 +942,6 @@ static void arith_skip(const char **p) {
 }
 
 static long arith_comma(const char **p);
-
-/* Equality / relational / bitwise / logical operators are spelled with
- * `<`, `>` and `&`, which the lexer would otherwise take for redirection —
- * so the whole `$((...))` is copied verbatim before this runs.  Still, we
- * must strip any escaping the token layer added. */
-static int arith_match(const char **p, const char *op) {
-    arith_skip(p);
-    size_t n = strlen(op);
-    if (strncmp(*p, op, n) != 0) return 0;
-    /* don't match `<` when the text is actually `<<` or `<=` */
-    if (op[0] == '<' || op[0] == '>') {
-        char prev = (n >= 2) ? op[n - 1] : '\0';
-        char next = (*p)[n];
-        if (n == 1 && (next == op[0] || next == '=')) return 0;
-        (void)prev;
-    }
-    if (op[0] == '=' && n == 1 && (*p)[1] == '=') return 0;  /* == is its own */
-    if (op[0] == '&' && n == 1 && (*p)[1] == '&') return 0;
-    if (op[0] == '|' && n == 1 && (*p)[1] == '|') return 0;
-    *p += n;
-    return 1;
-}
 
 static long arith_primary(const char **p) {
     arith_skip(p);

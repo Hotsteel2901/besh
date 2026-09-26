@@ -1,0 +1,5 @@
+echo one > /tmp/bt/f.txt
+cat /tmp/bt/f.txt
+echo two >> /tmp/bt/f.txt
+cat /tmp/bt/f.txt
+rm -f /tmp/bt/f.txt

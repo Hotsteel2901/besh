@@ -1,0 +1,13 @@
+# `complete -p` must round-trip registered rules; `-r` must remove them.
+complete -W "one two" cmd_a
+complete -F myfn cmd_b
+complete -A directory cmd_c
+complete -p
+complete -r cmd_a cmd_c
+complete -p
+exit 0
+--- expect ---
+complete -A directory cmd_c
+complete -F myfn cmd_b
+complete -W 'one two' cmd_a
+complete -F myfn cmd_b

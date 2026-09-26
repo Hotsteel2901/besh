@@ -1,0 +1,6 @@
+echo A >&2
+sh -c 'echo B >&2' 2>/dev/null
+echo C 2>&1
+echo D > /tmp/bt/d1.txt 2>&1
+cat /tmp/bt/d1.txt
+exec 9>/tmp/bt/d2.txt

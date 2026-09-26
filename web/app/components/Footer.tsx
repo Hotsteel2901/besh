@@ -17,7 +17,7 @@ export default function Footer() {
           </div>
           <p className="mt-3 max-w-sm font-mono text-xs leading-relaxed text-[color:var(--text-2)]">
             A bash-compatible shell written in C, remixed with fish &amp; zsh.
-            6.3k lines, 38 builtins, zero dependencies.
+            11.7k lines, 44 builtins, zero dependencies.
           </p>
         </div>
 
@@ -39,7 +39,7 @@ export default function Footer() {
       <div className="border-t border-[color:var(--line)]">
         <div className="shell flex flex-col items-center gap-2 py-6 text-center md:flex-row md:justify-between md:text-left">
           <p className="font-mono text-xs text-[color:var(--text-3)]">
-            besh v1.1.0 · MIT licensed · built for 80s terminal nostalgia
+            besh v1.2.0 · MIT licensed · built for 80s terminal nostalgia
           </p>
           <p className="font-mono text-xs tracking-[0.2em] text-[color:var(--green)]">
             ████████ READY ████████

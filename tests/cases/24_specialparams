@@ -1,0 +1,8 @@
+false; echo "q=$?"
+(exit 3); echo "q2=$?"
+x=1; echo "pid_set=${$:+yes}"
+f() { echo "f: $# [$*] [$1] [$2]"; }
+f a b c
+set -- p q
+echo "pos: $# $1 $2"
+echo "unset=[${nope}] len=${#nope}"

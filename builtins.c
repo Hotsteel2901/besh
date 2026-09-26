@@ -10,6 +10,18 @@
 #include <ctype.h>
 #include <regex.h>
 
+/* getcwd() is declared warn_unused_result, which turns every call into a
+ * warning.  All our callers either know the buffer is large enough or fall
+ * back to a sensible default, so funnel them through one place that
+ * handles failure explicitly.  Never returns NULL: on failure the caller's
+ * buffer is left holding an empty string. */
+static char *proj_getcwd(char *buf, size_t size) {
+    if (getcwd(buf, size) == NULL) {
+        if (size > 0) buf[0] = '\0';
+    }
+    return buf;
+}
+
 /* ================================================================
  *  cd [dir]  — change working directory
  *  cd -      — previous directory (OLDPWD)
@@ -32,7 +44,7 @@ int cd_to(const char *dir) {
     char *expanded = tilde_expand(dir);
 
     char oldpwd[MAX_PATH];
-    getcwd(oldpwd, sizeof(oldpwd));
+    proj_getcwd(oldpwd, sizeof(oldpwd));
 
     if (chdir(expanded) < 0) {
         fprintf(stderr, "besh: cd: %s: %s\n", expanded, strerror(errno));
@@ -42,7 +54,7 @@ int cd_to(const char *dir) {
     free(expanded);
 
     char newpwd[MAX_PATH];
-    getcwd(newpwd, sizeof(newpwd));
+    proj_getcwd(newpwd, sizeof(newpwd));
     snprintf(sh->cwd, sizeof(sh->cwd), "%s", newpwd);
 
     sh_setenv("OLDPWD", oldpwd, 1);
@@ -543,7 +555,7 @@ int builtin_dirs(int argc, char **argv) {
 int builtin_pushd(int argc, char **argv) {
     Shell *sh = shell_get();
     char cur[MAX_PATH];
-    getcwd(cur, sizeof(cur));
+    proj_getcwd(cur, sizeof(cur));
 
     if (argc == 1) {
         /* swap top two entries */
@@ -563,7 +575,7 @@ int builtin_pushd(int argc, char **argv) {
     if (cd_to(argv[1])) return 1;
 
     char newcur[MAX_PATH];
-    getcwd(newcur, sizeof(newcur));
+    proj_getcwd(newcur, sizeof(newcur));
     dirs_push(newcur);
     dirs_print(0);
     return 0;
@@ -1171,6 +1183,7 @@ int builtin_history(int argc, char **argv) {
     Shell *sh = shell_get();
 
     int i = 1;
+    int show_n = -1;            /* `history -N` shorthand for the last N */
     while (i < argc && argv[i][0] == '-' && argv[i][1]) {
         if (strcmp(argv[i], "--") == 0) { i++; break; }
         if (strcmp(argv[i], "-c") == 0) { history_clear(); return 0; }
@@ -1182,30 +1195,48 @@ int builtin_history(int argc, char **argv) {
                 fprintf(stderr, "besh: history: -d: option requires an argument\n");
                 return 1;
             }
-            int off = atoi(argv[i + 1]);
-            if (history_delete(off - 1) != 0) {
+            /* the argument is a history *position* (1-based, exactly as
+             * printed by `history`), not a list offset */
+            int pos = atoi(argv[i + 1]);
+            if (history_delete(pos - 1) != 0) {
                 fprintf(stderr, "besh: history: %s: history position out of range\n",
                         argv[i + 1]);
                 return 1;
             }
             return 0;
         }
+        /* `history -N` — show the last N entries */
+        if (argv[i][1] >= '0' && argv[i][1] <= '9') {
+            const char *d = argv[i] + 1;
+            if (strspn(d, "0123456789") == strlen(d)) {
+                show_n = atoi(d);
+                i++;
+                break;
+            }
+        }
         fprintf(stderr, "besh: history: %s: invalid option\n", argv[i]);
         return 1;
     }
 
-    int start = 0;
-    int count = sh->nhist;
-    if (i < argc) {
-        int n = atoi(argv[i]);
-        if (n < 0) {
-            start = sh->nhist + n;
-            if (start < 0) start = 0;
-            count = sh->nhist - start;
-        } else {
-            start = sh->nhist - n;
-            if (start < 0) start = 0;
-            count = sh->nhist - start;
+    int start, count;
+    if (show_n >= 0) {
+        start = sh->nhist - show_n;
+        if (start < 0) start = 0;
+        count = sh->nhist - start;
+    } else {
+        start = 0;
+        count = sh->nhist;
+        if (i < argc) {
+            int n = atoi(argv[i]);
+            if (n < 0) {
+                start = sh->nhist + n;
+                if (start < 0) start = 0;
+                count = sh->nhist - start;
+            } else {
+                start = sh->nhist - n;
+                if (start < 0) start = 0;
+                count = sh->nhist - start;
+            }
         }
     }
 
@@ -1279,6 +1310,26 @@ static char *hist_substitute(const char *cmd, const char *subst) {
     return res;
 }
 
+/* fc must not leave *itself* at the tail of the history list: bash
+ * replaces the `fc …` entry with the command it actually ran.  The REPL
+ * has already pushed the `fc …` line by the time this builtin runs, so
+ * drop that trailing entry before recording the substituted command.
+ * Without this, `fc -s` with no argument would re-run the literal text
+ * `fc -s` for ever.  Returns 0 when an entry was dropped. */
+static int hist_drop_trailing_fc(void) {
+    Shell *sh = shell_get();
+    if (sh->nhist == 0) return 0;
+    const char *last = sh->history[sh->nhist - 1];
+    while (*last == ' ' || *last == '\t') last++;
+    if (strncmp(last, "fc ", 3) != 0 && strcmp(last, "fc") != 0)
+        return 0;
+    free(sh->history[sh->nhist - 1]);
+    sh->history[sh->nhist - 1] = NULL;
+    sh->hist_time[sh->nhist - 1] = 0;
+    sh->nhist--;
+    return 1;
+}
+
 int builtin_fc(int argc, char **argv) {
     Shell *sh = shell_get();
     int list = 0, silent = 0, edit = 0;
@@ -1305,17 +1356,23 @@ int builtin_fc(int argc, char **argv) {
     const char *arglast  = (i < argc) ? argv[i++] : NULL;
     int first = -1, last = -1;
 
+    /* Resolve the selection while the `fc …` line is still present, then
+     * remove it so the chosen entry is what ends up at the tail. */
     if (silent) {
         const char *subst = NULL, *cmdspec = NULL;
         if (argfirst) {
             if (strchr(argfirst, '=')) { subst = argfirst; cmdspec = arglast; }
             else cmdspec = argfirst;
         }
+        int idx = -1;
+        /* bash: `fc -s` with no operand means the *previous* command, so
+         * look past the trailing `fc …` entry first. */
+        hist_drop_trailing_fc();
         if (sh->nhist == 0) {
             fprintf(stderr, "besh: fc: no command found\n");
             return 1;
         }
-        int idx = sh->nhist - 1;
+        idx = sh->nhist - 1;
         if (cmdspec && !hist_resolve(cmdspec, &idx)) {
             fprintf(stderr, "besh: fc: %s: history specification out of range\n", cmdspec);
             return 1;
@@ -1330,6 +1387,10 @@ int builtin_fc(int argc, char **argv) {
     }
 
     if (list || edit) {
+        /* `fc -e` (like `fc -s`) must resolve its selection *before* the
+         * trailing `fc …` line is counted, otherwise `-1` — and the
+         * implicit "last command" — both point at fc itself. */
+        if (edit) hist_drop_trailing_fc();
         if (argfirst) {
             if (!hist_resolve(argfirst, &first)) {
                 fprintf(stderr, "besh: fc: %s: history specification out of range\n", argfirst);
@@ -2454,23 +2515,67 @@ int builtin_umask(int argc, char **argv) {
  * ================================================================ */
 static int builtin_help(int argc, char **argv) {
     if (argc > 1) {
-        if (strcmp(argv[1], "cd") == 0)
+        const char *t = argv[1];
+        if (strcmp(t, "cd") == 0)
             printf("cd: cd [dir]\n    Change the current directory to DIR.\n");
-        else if (strcmp(argv[1], "echo") == 0)
+        else if (strcmp(t, "echo") == 0)
             printf("echo: echo [-neE] [arg ...]\n    Print arguments to stdout.\n");
+        else if (strcmp(t, "fc") == 0)
+            printf("fc: fc [-l] [-n] [-r] [-s [old=new] [cmd]] [-e [editor] [first] [last]]\n"
+                   "    -l list history entries        -s re-execute an entry\n"
+                   "    -e edit the selection then run it\n"
+                   "    Editor comes from the -e option, then $FCEDIT, then $EDITOR, then vi.\n");
+        else if (strcmp(t, "history") == 0)
+            printf("history: history [-c] [-d pos] [-a] [-r] [-w] [-N]\n"
+                   "    -c clear   -d pos delete entry at 1-based position pos\n"
+                   "    -a append  -r read   -w write   -N show the last N entries\n"
+                   "    Set $HISTTIMEFORMAT to render timestamps (e.g. \"%%F %%T \").\n");
+        else if (strcmp(t, "complete") == 0)
+            printf("complete: complete [-W wordlist] [-F func] [-A action] [name ...]\n"
+                   "    complete -p              list registered rules\n"
+                   "    complete -r [name ...]   remove one (or all) rules\n"
+                   "    A -F function may print candidates one per line, or set\n"
+                   "    COMPREPLY.  Tab in the line editor consults these rules\n"
+                   "    before falling back to filename completion.\n");
+        else if (strcmp(t, "compgen") == 0)
+            printf("compgen: compgen [-W wordlist] [-F func] [-A action] [word]\n"
+                   "    -A command|builtin|function|alias|variable|keyword|file|directory\n"
+                   "    Prints one match per line; exits 1 when there are none.\n");
+        else if (strcmp(t, "declare") == 0 || strcmp(t, "typeset") == 0)
+            printf("%s: %s [-a|-A] [-r] [-x] [name[=value] ...]\n"
+                   "    Declare variables.  -a array, -A associative, -r readonly,\n"
+                   "    -x export, -p print declarations, -f functions.\n", t, t);
+        else if (strcmp(t, "local") == 0)
+            printf("local: local [name[=value] ...]\n"
+                   "    Declare variables scoped to the enclosing function.\n");
+        else if (strcmp(t, "set") == 0)
+            printf("set: set [-eufxvaC] [--] [arg ...]\n"
+                   "    -e errexit  -u nounset  -f noglob  -x xtrace\n"
+                   "    -v verbose  -a allexport  -C noclobber\n"
+                   "    set -- a b c replaces the positional parameters.\n");
         else
-            printf("besh: help: no help for %s\n", argv[1]);
+            printf("besh: help: no help for %s\n", t);
     } else {
-        printf("besh built-in commands (41):\n");
-        printf("  .  abbr  alias  bg  break  [  cd  compgen  complete  continue\n");
-        printf("  dirs  echo  exec  exit  export  false  fc  fg  help  history\n");
-        printf("  jobs  popd  pushd  pwd  read  readonly  return  set  setopt\n");
-        printf("  shift  source  test  times  trap  true  type  umask  unalias\n");
-        printf("  unset  unsetopt  wait\n");
+        /* Generate the list straight from the registry so it can never
+         * drift out of sync when a builtin is added or removed. */
+        int n = builtin_count();
+        printf("besh built-in commands (%d):\n", n);
+        int col = 0;
+        for (int i = 0; i < n; i++) {
+            const char *nm = builtin_name(i);
+            printf("  %-9s", nm);
+            if (++col % 7 == 0) printf("\n");
+        }
+        if (col % 7 != 0) printf("\n");
         printf("Type 'help name' for more info.\n");
         printf("\nfish/zsh features: autosuggestions (right-arrow/Tab),\n");
         printf("  syntax highlighting, abbr, Ctrl-R reverse search,\n");
-        printf("  autocd, globstar '**', brace {a,b} expansion, dirs stack.\n");
+        printf("  autocd, globstar '**', brace {a,b} expansion, dirs stack,\n");
+        printf("  process substitution <(...) / >(...), { ...; } groups,\n");
+        printf("  compound redirections, fd duplication (>&N), and the\n");
+        printf("  zsh-style command_not_found_handler hook.\n");
+        printf("  Programmable completion: complete / compgen (+ Tab).\n");
+        printf("  History: fc -l / -s / -e, timestamps via HISTTIMEFORMAT.\n");
     }
     return 0;
 }

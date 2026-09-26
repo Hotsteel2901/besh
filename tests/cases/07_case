@@ -1,0 +1,1 @@
+case abc in a*) echo A;; b*) echo B;; *) echo D;; esac

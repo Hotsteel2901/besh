@@ -1,0 +1,3 @@
+echo {1..3}
+echo {a,b}{1,2}
+echo pre{1..2}post

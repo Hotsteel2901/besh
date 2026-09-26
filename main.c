@@ -11,6 +11,11 @@ Shell *shell_get(void) { return &_shell; }
 /* ---- history storage helpers (defined further down) ---------- */
 static void hist_ensure_cap(int need);
 
+/* ---- line-editor output helper (defined further down) -------- */
+/* A thin wrapper around write(2) so the many fire-and-forget writes in
+ * the editor do not each need a hand-rolled unused-result dance. */
+static void em_write(int fd, const char *s, size_t n);
+
 /* ---- utility allocators (used everywhere) -------------------- */
 void *sh_malloc(size_t n) {
     void *p = malloc(n);
@@ -563,12 +568,12 @@ char *resolve_path(const char *cmd) {
 static void sigint_handler(int sig) {
     (void)sig;
     Shell *sh = shell_get();
-    write(STDOUT_FILENO, "\n", 1);
+    em_write(STDOUT_FILENO, "\n", 1);
     /* if no foreground job, just redraw prompt */
     sh->line_pos = 0;
     sh->line_len = 0;
     sh->line_buf[0] = '\0';
-    if (sh->running) write(STDOUT_FILENO, sh->prompt, strlen(sh->prompt));
+    if (sh->running) em_write(STDOUT_FILENO, sh->prompt, strlen(sh->prompt));
 }
 
 static void sigchld_handler(int sig) {
@@ -885,7 +890,7 @@ static void write_highlighted(int fd, const char *line) {
 
     while (*p) {
         if (*p == ' ' || *p == '\t') {
-            if (o + 8 >= (int)sizeof(ob)) { write(fd, ob, o); o = 0; }
+            if (o + 8 >= (int)sizeof(ob)) { em_write(fd, ob, o); o = 0; }
             ob[o++] = *p++;
             continue;
         }
@@ -920,7 +925,7 @@ static void write_highlighted(int fd, const char *line) {
             }
         }
 
-        if (o + wlen + 32 >= (int)sizeof(ob)) { write(fd, ob, o); o = 0; }
+        if (o + wlen + 32 >= (int)sizeof(ob)) { em_write(fd, ob, o); o = 0; }
         if (color) {
             int n = snprintf(ob + o, sizeof(ob) - o, "%s", color);
             o += n;
@@ -937,7 +942,7 @@ static void write_highlighted(int fd, const char *line) {
         first = 0;
     }
     ob[o] = '\0';
-    write(fd, ob, o);
+    em_write(fd, ob, o);
 }
 
 /* ================================================================
@@ -1007,14 +1012,14 @@ static void line_refresh(void) {
 
     /* clear the line and write the prompt */
     pos += snprintf(buf + pos, sizeof(buf) - pos, "\r\x1b[K%s", sh->prompt);
-    write(sh->term_fd, buf, pos);
+    em_write(sh->term_fd, buf, pos);
     pos = 0;
 
     /* write the input (with fish-style syntax highlighting) */
     if (sh->opt_syntaxhighlight)
         write_highlighted(sh->term_fd, sh->line_buf);
     else
-        write(sh->term_fd, sh->line_buf, sh->line_len);
+        em_write(sh->term_fd, sh->line_buf, sh->line_len);
 
     /* fish-style autosuggestion (dim, after the cursor when at EOL) */
     int sugg = 0;
@@ -1023,7 +1028,7 @@ static void line_refresh(void) {
     if (sugg > 0) {
         static char sbuf[131072];
         int n = snprintf(sbuf, sizeof(sbuf), "\x1b[2m%s\x1b[22m", sh->suggestion);
-        write(sh->term_fd, sbuf, n);
+        em_write(sh->term_fd, sbuf, n);
     }
 
     /* reposition the cursor using cursor-left escapes.
@@ -1035,7 +1040,7 @@ static void line_refresh(void) {
         nleft += utf8_width(sh->suggestion, strlen(sh->suggestion));
     if (nleft > 0) {
         int n = snprintf(buf, sizeof(buf), "\x1b[%dD", nleft);
-        write(sh->term_fd, buf, n);
+        em_write(sh->term_fd, buf, n);
     }
 }
 
@@ -1165,7 +1170,7 @@ static void history_up(void) {
         }
         i--;
     }
-    write(sh->term_fd, "\a", 1);  /* no more matches */
+    em_write(sh->term_fd, "\a", 1);  /* no more matches */
 }
 
 static void history_down(void) {
@@ -1216,7 +1221,7 @@ static void history_search_reset(void) {
     sh->hist_pos = sh->nhist;
 }
 
-/* write() wrapper whose ignored result does not trip -Wunused-result */
+/* em_write() wrapper whose ignored result does not trip -Wunused-result */
 static void em_write(int fd, const char *s, size_t n) {
     ssize_t r = write(fd, s, n);
     (void)r;
@@ -1286,7 +1291,7 @@ static void line_complete(void) {
 
     int wlen = sh->line_pos - start;
     if (wlen == 0) {
-        write(sh->term_fd, "\a", 1);
+        em_write(sh->term_fd, "\a", 1);
         return;
     }
     char *word = sh_strndup(sh->line_buf + start, wlen);
@@ -1431,12 +1436,12 @@ static int reverse_search(void) {
             pos += snprintf(buf + pos, sizeof(buf) - pos, "%s", sh->history[cur]);
         else
             pos += snprintf(buf + pos, sizeof(buf) - pos, "%s", saved);
-        write(sh->term_fd, buf, pos);
+        em_write(sh->term_fd, buf, pos);
 
         int key = read_key();
 
         if (key == '\r' || key == '\n') {       /* accept */
-            write(sh->term_fd, "\r\n", 2);
+            em_write(sh->term_fd, "\r\n", 2);
             if (cur < sh->nhist) {
                 strncpy(sh->line_buf, sh->history[cur], sh->line_cap - 1);
             } else {
@@ -1508,11 +1513,11 @@ static char *read_line(void) {
 
     for (;;) {
         int key = read_key();
-        if (key < 0) { write(sh->term_fd, "\r\n", 2); return NULL; }
+        if (key < 0) { em_write(sh->term_fd, "\r\n", 2); return NULL; }
 
         switch (key) {
         case '\r': case '\n':  /* Enter */
-            write(sh->term_fd, "\r\n", 2);
+            em_write(sh->term_fd, "\r\n", 2);
             sh->line_buf[sh->line_len] = '\0';
             /* fish: expand an abbreviation at the end of the line */
             if (sh->line_len > 0 && abbr_expand_at_cursor()) {
@@ -1526,7 +1531,7 @@ static char *read_line(void) {
             return sh_strdup(sh->line_buf);
 
         case 3:   /* Ctrl-C — abort the current input line */
-            write(sh->term_fd, "^C\r\n", 4);
+            em_write(sh->term_fd, "^C\r\n", 4);
             sh->line_buf[0] = '\0';
             sh->line_len = 0;
             sh->line_pos = 0;
@@ -1536,7 +1541,7 @@ static char *read_line(void) {
 
         case 4:   /* Ctrl-D — EOF on empty line */
             if (sh->line_len == 0) {
-                write(sh->term_fd, "\r\n", 2);
+                em_write(sh->term_fd, "\r\n", 2);
                 return NULL;
             }
             line_delete_at_cursor();
@@ -1601,7 +1606,7 @@ static char *read_line(void) {
             break;
 
         case 12:  /* Ctrl-L — clear screen */
-            write(sh->term_fd, "\x1b[2J\x1b[H", 7);
+            em_write(sh->term_fd, "\x1b[2J\x1b[H", 7);
             line_refresh();
             break;
 
@@ -1711,16 +1716,22 @@ static int all_digits_str(const char *s) {
 
 static void incompleteness_word(const char *w,
                                 int *n_if, int *n_fi, int *n_do, int *n_done,
-                                int *n_case, int *n_esac,
+                                int *n_case, int *n_esac, int *n_head,
                                 int *cmd_pos, int *last_op) {
     if (!w || !*w) return;
     if (*cmd_pos) {
         if      (strcmp(w, "if")   == 0) (*n_if)++;
         else if (strcmp(w, "fi")   == 0) (*n_fi)++;
-        else if (strcmp(w, "do")   == 0) (*n_do)++;
+        else if (strcmp(w, "do")   == 0) { (*n_do)++; if (*n_head > 0) (*n_head)--; }
         else if (strcmp(w, "done") == 0) (*n_done)++;
         else if (strcmp(w, "case") == 0) (*n_case)++;
         else if (strcmp(w, "esac") == 0) (*n_esac)++;
+        /* `for x in …` / `while cond` / `until cond` / `select x in …`
+         * are not complete until their `do` arrives, which may be on a
+         * later line (`for x in a b c<newline>do<newline>…`). */
+        else if (strcmp(w, "for") == 0 || strcmp(w, "while") == 0 ||
+                 strcmp(w, "until") == 0 || strcmp(w, "select") == 0)
+            (*n_head)++;
     }
     /* words that open a new command slot on the same line */
     if (strcmp(w, "then") == 0 || strcmp(w, "do") == 0 ||
@@ -1738,6 +1749,7 @@ int sh_input_incomplete(const char *input) {
     int in_s = 0, in_d = 0, esc = 0;
     int paren = 0, brace = 0;
     int n_if = 0, n_fi = 0, n_do = 0, n_done = 0, n_case = 0, n_esac = 0;
+    int n_head = 0;   /* for/while/until/select awaiting their `do` */
     int cmd_pos = 1;
     int last_op = 0;
     int trailing_esc = 0;
@@ -1808,7 +1820,7 @@ int sh_input_incomplete(const char *input) {
                 snprintf(hd_delim[hd_n - 1], sizeof(hd_delim[0]), "%s", word);
             }
             incompleteness_word(word, &n_if, &n_fi, &n_do,
-                &n_done, &n_case, &n_esac, &cmd_pos, &last_op);
+                &n_done, &n_case, &n_esac, &n_head, &cmd_pos, &last_op);
             if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
             wl = 0;
             in_s = 1;
@@ -1820,7 +1832,7 @@ int sh_input_incomplete(const char *input) {
                 snprintf(hd_delim[hd_n - 1], sizeof(hd_delim[0]), "%s", word);
             }
             incompleteness_word(word, &n_if, &n_fi, &n_do,
-                &n_done, &n_case, &n_esac, &cmd_pos, &last_op);
+                &n_done, &n_case, &n_esac, &n_head, &cmd_pos, &last_op);
             if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
             wl = 0;
             in_d = 1;
@@ -1835,7 +1847,7 @@ int sh_input_incomplete(const char *input) {
             if (hd_n > hd_head && hd_delim[hd_n - 1][0] == '\0' && wl)
                 snprintf(hd_delim[hd_n - 1], sizeof(hd_delim[0]), "%s", word);
             incompleteness_word(word, &n_if, &n_fi, &n_do, &n_done,
-                &n_case, &n_esac, &cmd_pos, &last_op);
+                &n_case, &n_esac, &n_head, &cmd_pos, &last_op);
             if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
             wl = 0;
             if (c == '\n') {
@@ -1850,7 +1862,7 @@ int sh_input_incomplete(const char *input) {
         /* operators */
         if (c == '|') {
             word[wl] = '\0'; incompleteness_word(word, &n_if, &n_fi, &n_do,
-                &n_done, &n_case, &n_esac, &cmd_pos, &last_op);
+                &n_done, &n_case, &n_esac, &n_head, &cmd_pos, &last_op);
             if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
             wl = 0;
             if (i + 1 < n && input[i + 1] == '|') i++;   /* || */
@@ -1859,7 +1871,7 @@ int sh_input_incomplete(const char *input) {
         }
         if (c == '&') {
             word[wl] = '\0'; incompleteness_word(word, &n_if, &n_fi, &n_do,
-                &n_done, &n_case, &n_esac, &cmd_pos, &last_op);
+                &n_done, &n_case, &n_esac, &n_head, &cmd_pos, &last_op);
             if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
             wl = 0;
             if (i + 1 < n && input[i + 1] == '&') { i++; cmd_pos = 1; last_op = 1; }
@@ -1911,7 +1923,7 @@ int sh_input_incomplete(const char *input) {
     if (hd_n > hd_head && hd_delim[hd_n - 1][0] == '\0' && wl)
         snprintf(hd_delim[hd_n - 1], sizeof(hd_delim[0]), "%s", word);
     incompleteness_word(word, &n_if, &n_fi, &n_do, &n_done, &n_case,
-                        &n_esac, &cmd_pos, &last_op);
+                        &n_esac, &n_head, &cmd_pos, &last_op);
     if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
     trailing_esc = esc;
 
@@ -1922,7 +1934,7 @@ int sh_input_incomplete(const char *input) {
 
     if (in_s || in_d) return 2;
     if (trailing_esc || paren > 0 || brace > 0 || last_op) return 1;
-    if (n_if > n_fi || n_do > n_done || n_case > n_esac) return 1;
+    if (n_head > 0 || n_if > n_fi || n_do > n_done || n_case > n_esac) return 1;
     if (strcmp(last_word, "then") == 0 || strcmp(last_word, "do") == 0 ||
         strcmp(last_word, "else") == 0 || strcmp(last_word, "elif") == 0 ||
         strcmp(last_word, "in") == 0)
@@ -1994,7 +2006,16 @@ void history_add(const char *line) {
 
 void history_clear(void) {
     Shell *sh = shell_get();
-    for (int i = 0; i < sh->nhist; i++) free(sh->history[i]);
+    for (int i = 0; i < sh->nhist; i++) {
+        free(sh->history[i]);
+        sh->history[i] = NULL;
+    }
+    /* The line editor keeps a scratch entry one past the end (it holds the
+     * half-typed line while the user browses with the arrow keys).  That
+     * slot must be released too, otherwise the editor's own free() on the
+     * next Enter would hit the same pointer twice. */
+    free(sh->history[sh->nhist]);
+    sh->history[sh->nhist] = NULL;
     sh->nhist = 0;
     sh->hist_written = 0;
     sh->hist_pos = 0;
@@ -2005,11 +2026,17 @@ int history_delete(int idx) {
     Shell *sh = shell_get();
     if (idx < 0 || idx >= sh->nhist) return 1;
     free(sh->history[idx]);
+    /* Drop the scratch slot too: after the shift it would otherwise refer
+     * to an entry that is still live, and the editor's next Enter would
+     * free that live pointer. */
+    free(sh->history[sh->nhist]);
+    sh->history[sh->nhist] = NULL;
     memmove(&sh->history[idx], &sh->history[idx + 1],
             (sh->nhist - idx - 1) * sizeof(char *));
     memmove(&sh->hist_time[idx], &sh->hist_time[idx + 1],
             (sh->nhist - idx - 1) * sizeof(long));
     sh->nhist--;
+    sh->history[sh->nhist] = NULL;
     if (sh->hist_written > idx) sh->hist_written--;
     return 0;
 }
@@ -2110,7 +2137,8 @@ void shell_init(void) {
     sh->opt_syntaxhighlight = 1;   /* fish: colored input */
     sh->opt_histignoredups = 1;    /* skip consecutive duplicates */
 
-    getcwd(sh->cwd, sizeof(sh->cwd));
+    if (getcwd(sh->cwd, sizeof(sh->cwd)) == NULL)
+        sh->cwd[0] = '\0';
     snprintf(sh->prompt, sizeof(sh->prompt), "\x1b[1;32mbesh\x1b[0m:\x1b[1;34m\\W\x1b[0m$ ");
 
     /* init variable storage */

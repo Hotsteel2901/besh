@@ -1,0 +1,13 @@
+# Redirection targets must undergo variable / command substitution.
+d=/tmp/besh_re_$$
+f="$d/file.txt"
+mkdir -p "$d"
+echo one > "$f"
+echo two >> "$f"
+echo "content=$(cat "$f")"
+echo three > "$(echo $d)/sub.txt"
+echo "sub=$(cat "$d/sub.txt")"
+echo four > $d/unquoted.txt
+echo "unq=$(cat $d/unquoted.txt)"
+cat < "$f" | tail -1
+rm -rf "$d"

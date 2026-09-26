@@ -1,0 +1,16 @@
+# compgen must honour -W, -A builtin/function/alias/variable/keyword.
+complete -W "alpha beta gamma" mycmd
+func_one() { :; }
+alias al_one='echo'
+compgen -W "alpha beta gamma" -- al
+compgen -A builtin -- ec
+compgen -A function -- func_
+compgen -A alias -- al_
+compgen -A keyword -- whi
+exit 0
+--- expect ---
+alpha
+echo
+func_one
+al_one
+while

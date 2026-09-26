@@ -1,0 +1,13 @@
+printf "p\nq\n" > /tmp/bt/cr1.txt
+while read -r l; do echo "GOT:$l"; done < /tmp/bt/cr1.txt
+for i in 1 2 3; do echo "n$i"; done > /tmp/bt/cr2.txt
+cat /tmp/bt/cr2.txt
+if true; then echo IFYES; fi > /tmp/bt/cr3.txt
+cat /tmp/bt/cr3.txt
+{ echo A; echo B; } > /tmp/bt/cr4.txt
+cat /tmp/bt/cr4.txt
+for i in a b; do echo "e$i" >&2; done 2>/tmp/bt/cr5.txt
+cat /tmp/bt/cr5.txt
+while read -r x; do echo "X:$x"; done < <(printf "1\n2\n")
+case abc in abc) echo MATCH;; esac > /tmp/bt/cr6.txt
+cat /tmp/bt/cr6.txt

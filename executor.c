@@ -32,9 +32,20 @@ static int setup_redirections(Redir *redirs);
  * bash keeps the pipe end only long enough for the redirection to be
  * installed, and leaking it would keep the writer's pipe from ever
  * seeing EOF (so the next `while ... < <(...)` would read nothing). */
-static const char *redir_resolve_name(const char *name, int *psub_fd) {
+/* Redirection targets are ordinary words: variables, command substitution,
+ * tilde and the quote-protection layer all apply before open(2) sees the
+ * name.  The expansion is performed here, once, so every caller (builtin
+ * path, fork/exec path, compound path) gets the same behaviour; the caller
+ * frees a non-NULL *owned result.  Process substitution is handled first
+ * because its marker byte must not reach the expander.
+ *
+ * `*owned` is set to 1 when the returned pointer must be freed. */
+static const char *redir_resolve_name_ex(const char *name, int *psub_fd,
+                                         int *owned) {    if (owned) *owned = 0;
     if (psub_fd) *psub_fd = -1;
-    if (name && (name[0] == '\002' || name[0] == '\003')) {
+    if (!name) return name;
+
+    if (name[0] == '\002' || name[0] == '\003') {
         int pid = -1;
         char *path = expand_process_sub(name, &pid);
         if (path) {
@@ -46,9 +57,20 @@ static const char *redir_resolve_name(const char *name, int *psub_fd) {
                 const char *slash = strrchr(path, '/');
                 if (slash && slash[1]) *psub_fd = atoi(slash + 1);
             }
+            if (owned) *owned = 1;
             return path;                 /* freed by the caller after use */
         }
         return "/dev/null";
+    }
+
+    /* `$(...)`, `$VAR` and friends — only when something actually needs
+     * expanding, so the common literal case allocates nothing. */
+    if (strchr(name, '$') || strchr(name, '`') || strchr(name, '~')) {
+        char *ex = expand_string(name);
+        char *un = unescape_token(ex);
+        free(ex);
+        if (owned) *owned = 1;
+        return un;
     }
     return name;
 }
@@ -208,17 +230,21 @@ static int wait_for_pid(pid_t pid) {
 /* ---- set up redirections ------------------------------------- */
 static int setup_redirections(Redir *redirs) {
     Shell *sh = shell_get();
+    int psub_fd = -1;
+    int rname_owned = 0;
+    const char *rname = NULL;
 
     for (Redir *r = redirs; r; r = r->next) {
         int fd = -1;
-        int psub_fd = -1;
+        psub_fd = -1;
+        rname_owned = 0;
         int target_fd = (r->src_fd >= 0) ? r->src_fd : STDOUT_FILENO;
-        const char *rname = redir_resolve_name(r->filename, &psub_fd);
+        rname = redir_resolve_name_ex(r->filename, &psub_fd, &rname_owned);
 
         switch (r->type) {
         case REDIR_IN:
             fd = open(rname, O_RDONLY);
-            if (fd < 0) { perror(rname); return -1; }
+            if (fd < 0) { perror(rname); goto redir_fail; }
             dup2(fd, target_fd);
             close(fd);
             break;
@@ -227,7 +253,7 @@ static int setup_redirections(Redir *redirs) {
             int flags = O_WRONLY | O_CREAT | O_TRUNC;
             if (sh->opt_noclobber) flags |= O_EXCL;
             fd = open(rname, flags, 0644);
-            if (fd < 0) { perror(rname); return -1; }
+            if (fd < 0) { perror(rname); goto redir_fail; }
             dup2(fd, target_fd);
             close(fd);
             break;
@@ -235,35 +261,35 @@ static int setup_redirections(Redir *redirs) {
 
         case REDIR_APPEND:
             fd = open(rname, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (fd < 0) { perror(rname); return -1; }
+            if (fd < 0) { perror(rname); goto redir_fail; }
             dup2(fd, target_fd);
             close(fd);
             break;
 
         case REDIR_CLOBBER:
             fd = open(rname, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) { perror(rname); return -1; }
+            if (fd < 0) { perror(rname); goto redir_fail; }
             dup2(fd, target_fd);
             close(fd);
             break;
 
         case REDIR_ERR:
             fd = open(rname, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) { perror(rname); return -1; }
+            if (fd < 0) { perror(rname); goto redir_fail; }
             dup2(fd, STDERR_FILENO);
             close(fd);
             break;
 
         case REDIR_ERRAPPEND:
             fd = open(rname, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (fd < 0) { perror(rname); return -1; }
+            if (fd < 0) { perror(rname); goto redir_fail; }
             dup2(fd, STDERR_FILENO);
             close(fd);
             break;
 
         case REDIR_BOTH:
             fd = open(rname, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) { perror(rname); return -1; }
+            if (fd < 0) { perror(rname); goto redir_fail; }
             dup2(fd, STDOUT_FILENO);
             dup2(fd, STDERR_FILENO);
             close(fd);
@@ -272,14 +298,17 @@ static int setup_redirections(Redir *redirs) {
         case REDIR_HEREDOC:
         case REDIR_HEREDOC_DASH: {
             int hpipe[2];
-            if (pipe(hpipe) < 0) { perror("pipe"); return -1; }
+            if (pipe(hpipe) < 0) { perror("pipe"); goto redir_fail; }
             if (r->heredoc) {
                 char *content;
                 if (r->quoted)
                     content = sh_strdup(r->heredoc);
                 else
                     content = expand_string(r->heredoc);
-                write(hpipe[1], content, strlen(content));
+                if (write(hpipe[1], content, strlen(content)) < 0) {
+                    /* the read end is gone (e.g. the consumer exited);
+                     * nothing useful to report here */
+                }
                 free(content);
             }
             close(hpipe[1]);
@@ -312,15 +341,68 @@ static int setup_redirections(Redir *redirs) {
          * substitution) can be released.  Keeping it open would stop the
          * writer from ever seeing EOF. */
         if (psub_fd >= 0) close(psub_fd);
+        if (rname_owned) { free((void *)rname); rname_owned = 0; }
     }
 
     return 0;
+
+redir_fail:
+    if (psub_fd >= 0) close(psub_fd);
+    if (rname_owned) free((void *)rname);
+    return -1;
 }
 
 /* ---- helper: detect NAME=value assignment word ---------------- */
 /* Recognise "name=", "name+=", "name[idx]=", "name[idx]+=".  Returns the
  * length of the assignment prefix (up to and including '=' / '+='), or 0
  * if `word` is not an assignment; *op is set to 1 for '+='. */
+/* Look up a shell function by name.  Declared here (rather than in
+ * shell.h) because it is only used inside this translation unit. */
+static Function *exec_func_lookup(const char *name) {
+    Shell *sh = shell_get();
+    for (int i = 0; i < sh->nfuncs; i++)
+        if (strcmp(sh->funcs[i].name, name) == 0)
+            return &sh->funcs[i];
+    return NULL;
+}
+
+/* Invoke a shell function that is already known to exist.  `argv` holds
+ * the arguments verbatim: argv[0] becomes $1, argv[1] becomes $2, and so
+ * on.  (The normal command-dispatch path passes `cmd_argv + 1`, since for
+ * a regular call the command name is not an argument.)  Saves and
+ * restores the caller's positional parameters and pushes a `local`
+ * scope, exactly as the inline path in execute_node_internal() does. */
+static int call_shell_function(Function *fn, int argc, char **argv) {
+    Shell *sh = shell_get();
+
+    char **old_pos = sh->positional;
+    int old_npos = sh->npositional;
+
+    if (argc > 0) {
+        sh->positional = sh_malloc(argc * sizeof(char *));
+        for (int j = 0; j < argc; j++)
+            sh->positional[j] = sh_strdup(argv[j]);
+    } else {
+        sh->positional = NULL;
+    }
+    sh->npositional = argc;
+
+    scope_push();
+    int ret = execute_node_internal(fn->body, NULL, NULL, 0);
+    scope_pop();
+    sh->return_request = 0;
+
+    for (int j = 0; j < sh->npositional; j++)
+        free(sh->positional[j]);
+    free(sh->positional);
+
+    sh->positional = old_pos;
+    sh->npositional = old_npos;
+
+    sh->exit_status = ret;
+    return ret;
+}
+
 static int assign_prefix_len(const char *word, int *op) {
     if (op) *op = 0;
     if (!word) return 0;
@@ -476,57 +558,21 @@ int execute_command(ASTNode *node) {
     int cmd_argc = expanded_argc - cmd_start;
 
     /* first, check if it's a shell function */
-    for (int i = 0; i < sh->nfuncs; i++) {
-        if (strcmp(cmd_argv[0], sh->funcs[i].name) == 0) {
-            /* save old positional parameters */
-            char **old_pos = sh->positional;
-            int old_npos = sh->npositional;
-
-            /* set new positional parameters from function args */
-            int fnargs = cmd_argc - 1;
-            if (fnargs > 0) {
-                sh->positional = sh_malloc(fnargs * sizeof(char *));
-                for (int j = 0; j < fnargs; j++)
-                    sh->positional[j] = sh_strdup(cmd_argv[j + 1]);
-            } else {
-                sh->positional = NULL;
-            }
-            sh->npositional = fnargs;
-
-            /* push a function-call scope for `local` variables */
-            scope_push();
-
-            int ret = execute_node_internal(sh->funcs[i].body,
-                                            NULL, NULL, 0);
-
-            /* discard locals and restore the caller's variables */
-            scope_pop();
-            sh->return_request = 0;
-
-            /* free function positional parameters
-             * (shift may have consumed some of them) */
-            for (int j = 0; j < sh->npositional; j++)
-                free(sh->positional[j]);
-            free(sh->positional);
-
-            /* restore old positional parameters */
-            sh->positional = old_pos;
-            sh->npositional = old_npos;
-
-            sh->exit_status = ret;
-            /* restore env from prefix assignments */
-            for (int i2 = 0; i2 < n_assign; i2++) {
-                char *eq = strchr(expanded_argv[i2], '=');
-                *eq = '\0';
-                char *old = sh_getenv(expanded_argv[i2]);
-                if (old) setenv(expanded_argv[i2], old, 1);
-                else unsetenv(expanded_argv[i2]);
-                *eq = '=';
-            }
-            for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
-            free(expanded_argv);
-            return ret;
+    Function *fn = exec_func_lookup(cmd_argv[0]);
+    if (fn) {
+        int ret = call_shell_function(fn, cmd_argc - 1, cmd_argv + 1);
+        /* restore env from prefix assignments */
+        for (int i2 = 0; i2 < n_assign; i2++) {
+            char *eq = strchr(expanded_argv[i2], '=');
+            *eq = '\0';
+            char *old = sh_getenv(expanded_argv[i2]);
+            if (old) setenv(expanded_argv[i2], old, 1);
+            else unsetenv(expanded_argv[i2]);
+            *eq = '=';
         }
+        for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
+        free(expanded_argv);
+        return ret;
     }
 
     /* check builtins */
@@ -538,47 +584,64 @@ int execute_command(ASTNode *node) {
     if (bf) {
         /* handle redirections for builtins */
         int saved_stdin = -1, saved_stdout = -1, saved_stderr = -1;
+        int redir_failed = 0;
 
         /* set up redirections */
         for (Redir *r = node->redirs; r; r = r->next) {
             int bpsub_fd = -1;
-            const char *rname = redir_resolve_name(r->filename, &bpsub_fd);
+            int brname_owned = 0;
+            const char *rname = redir_resolve_name_ex(r->filename, &bpsub_fd,
+                                                      &brname_owned);
             switch (r->type) {
             case REDIR_IN:
                 if (saved_stdin < 0) saved_stdin = dup(STDIN_FILENO);
                 { int fd = open(rname, O_RDONLY);
-                  if (fd >= 0) { dup2(fd, STDIN_FILENO); close(fd); } }
+                  if (fd < 0) { fprintf(stderr, "besh: %s: %s\n", rname, strerror(errno)); redir_failed = 1; }
+                  else { dup2(fd, STDIN_FILENO); close(fd); } }
                 break;
-            case REDIR_OUT:
+            case REDIR_OUT: {
                 if (saved_stdout < 0) saved_stdout = dup(STDOUT_FILENO);
-                { int fd = open(rname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                  if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); } }
+                int flags = O_WRONLY | O_CREAT | O_TRUNC;
+                if (sh->opt_noclobber) flags |= O_EXCL;
+                int fd = open(rname, flags, 0644);
+                if (fd < 0) {
+                    fprintf(stderr, "besh: %s: %s\n", rname, strerror(errno));
+                    redir_failed = 1;
+                } else {
+                    dup2(fd, STDOUT_FILENO); close(fd);
+                }
                 break;
+            }
             case REDIR_APPEND:
                 if (saved_stdout < 0) saved_stdout = dup(STDOUT_FILENO);
                 { int fd = open(rname, O_WRONLY|O_CREAT|O_APPEND, 0644);
-                  if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); } }
+                  if (fd < 0) { fprintf(stderr, "besh: %s: %s\n", rname, strerror(errno)); redir_failed = 1; }
+                  else { dup2(fd, STDOUT_FILENO); close(fd); } }
                 break;
             case REDIR_ERR:
                 if (saved_stderr < 0) saved_stderr = dup(STDERR_FILENO);
                 { int fd = open(rname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                  if (fd >= 0) { dup2(fd, STDERR_FILENO); close(fd); } }
+                  if (fd < 0) { fprintf(stderr, "besh: %s: %s\n", rname, strerror(errno)); redir_failed = 1; }
+                  else { dup2(fd, STDERR_FILENO); close(fd); } }
                 break;
             case REDIR_BOTH:
                 if (saved_stdout < 0) saved_stdout = dup(STDOUT_FILENO);
                 if (saved_stderr < 0) saved_stderr = dup(STDERR_FILENO);
                 { int fd = open(rname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                  if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); } }
+                  if (fd < 0) { fprintf(stderr, "besh: %s: %s\n", rname, strerror(errno)); redir_failed = 1; }
+                  else { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); } }
                 break;
             case REDIR_ERRAPPEND:
                 if (saved_stderr < 0) saved_stderr = dup(STDERR_FILENO);
                 { int fd = open(rname, O_WRONLY|O_CREAT|O_APPEND, 0644);
-                  if (fd >= 0) { dup2(fd, STDERR_FILENO); close(fd); } }
+                  if (fd < 0) { fprintf(stderr, "besh: %s: %s\n", rname, strerror(errno)); redir_failed = 1; }
+                  else { dup2(fd, STDERR_FILENO); close(fd); } }
                 break;
             case REDIR_CLOBBER:
                 if (saved_stdout < 0) saved_stdout = dup(STDOUT_FILENO);
                 { int fd = open(rname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                  if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); } }
+                  if (fd < 0) { fprintf(stderr, "besh: %s: %s\n", rname, strerror(errno)); redir_failed = 1; }
+                  else { dup2(fd, STDOUT_FILENO); close(fd); } }
                 break;
             case REDIR_DUPIN:
             case REDIR_DUPOUT:
@@ -608,6 +671,29 @@ int execute_command(ASTNode *node) {
             default: break;
             }
             if (bpsub_fd >= 0) close(bpsub_fd);
+            if (brname_owned) free((void *)rname);
+        }
+
+        /* A redirection failure must abort the command (bash reports the
+         * error and returns 1 without running the builtin). */
+        if (redir_failed) {
+            if (saved_stdin >= 0)  { dup2(saved_stdin, STDIN_FILENO); close(saved_stdin); }
+            if (saved_stdout >= 0) { dup2(saved_stdout, STDOUT_FILENO); close(saved_stdout); }
+            if (saved_stderr >= 0) { dup2(saved_stderr, STDERR_FILENO); close(saved_stderr); }
+            if (n_assign > 0) {
+                for (int i2 = 0; i2 < n_assign; i2++) {
+                    char *eq = strchr(expanded_argv[i2], '=');
+                    *eq = '\0';
+                    char *old = sh_getenv(expanded_argv[i2]);
+                    if (old) setenv(expanded_argv[i2], old, 1);
+                    else unsetenv(expanded_argv[i2]);
+                    *eq = '=';
+                }
+            }
+            for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
+            free(expanded_argv);
+            sh->exit_status = 1;
+            return 1;
         }
 
         int ret = bf(cmd_argc, cmd_argv);
@@ -655,6 +741,30 @@ int execute_command(ASTNode *node) {
             sh->exit_status = r;
             return r;
         }
+    }
+
+    /* command_not_found_handler (zsh-style): when the command cannot be
+     * resolved and a function of that name exists, call it with the whole
+     * command line as arguments and adopt its exit status.  The handler
+     * runs in the parent shell (so it can `cd`, print hints, offer to
+     * install the missing package, …); a non-zero return from the fork
+     * path below is consequently never reached. */
+    Function *cnf = exec_func_lookup("command_not_found_handler");
+    if (cnf && !resolve_path(cmd_argv[0])) {
+        int r = call_shell_function(cnf, cmd_argc, cmd_argv);
+        if (n_assign > 0) {
+            for (int i2 = 0; i2 < n_assign; i2++) {
+                char *eq = strchr(expanded_argv[i2], '=');
+                *eq = '\0';
+                char *old = sh_getenv(expanded_argv[i2]);
+                if (old) setenv(expanded_argv[i2], old, 1);
+                else unsetenv(expanded_argv[i2]);
+                *eq = '=';
+            }
+        }
+        for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
+        free(expanded_argv);
+        return r;
     }
 
     /* external command — fork and exec */
@@ -886,46 +996,51 @@ static int push_compound_redirs(Redir *redirs, int *save_in, int *save_out,
     *save_in = *save_out = *save_err = -1;
     if (!redirs) return 0;
 
+    int psub_fd = -1;
+    int name_owned = 0;
+    const char *name = NULL;
+
     for (Redir *r = redirs; r; r = r->next) {
-        int psub_fd = -1;
-        const char *name = redir_resolve_name(r->filename, &psub_fd);
+        psub_fd = -1;
+        name_owned = 0;
+        name = redir_resolve_name_ex(r->filename, &psub_fd, &name_owned);
         switch (r->type) {
         case REDIR_IN:
             if (*save_in < 0) *save_in = dup(STDIN_FILENO);
             { int fd = open(name, O_RDONLY);
-              if (fd < 0) { perror(name); return -1; }
+              if (fd < 0) { perror(name); goto crd_fail; }
               dup2(fd, STDIN_FILENO); close(fd); }
             break;
         case REDIR_OUT:
         case REDIR_CLOBBER:
             if (*save_out < 0) *save_out = dup(STDOUT_FILENO);
             { int fd = open(name, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-              if (fd < 0) { perror(name); return -1; }
+              if (fd < 0) { perror(name); goto crd_fail; }
               dup2(fd, STDOUT_FILENO); close(fd); }
             break;
         case REDIR_APPEND:
             if (*save_out < 0) *save_out = dup(STDOUT_FILENO);
             { int fd = open(name, O_WRONLY|O_CREAT|O_APPEND, 0644);
-              if (fd < 0) { perror(name); return -1; }
+              if (fd < 0) { perror(name); goto crd_fail; }
               dup2(fd, STDOUT_FILENO); close(fd); }
             break;
         case REDIR_ERR:
             if (*save_err < 0) *save_err = dup(STDERR_FILENO);
             { int fd = open(name, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-              if (fd < 0) { perror(name); return -1; }
+              if (fd < 0) { perror(name); goto crd_fail; }
               dup2(fd, STDERR_FILENO); close(fd); }
             break;
         case REDIR_ERRAPPEND:
             if (*save_err < 0) *save_err = dup(STDERR_FILENO);
             { int fd = open(name, O_WRONLY|O_CREAT|O_APPEND, 0644);
-              if (fd < 0) { perror(name); return -1; }
+              if (fd < 0) { perror(name); goto crd_fail; }
               dup2(fd, STDERR_FILENO); close(fd); }
             break;
         case REDIR_BOTH:
             if (*save_out < 0) *save_out = dup(STDOUT_FILENO);
             if (*save_err < 0) *save_err = dup(STDERR_FILENO);
             { int fd = open(name, O_WRONLY|O_CREAT|O_TRUNC, 0644);
-              if (fd < 0) { perror(name); return -1; }
+              if (fd < 0) { perror(name); goto crd_fail; }
               dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
             break;
         case REDIR_DUPIN:
@@ -954,8 +1069,14 @@ static int push_compound_redirs(Redir *redirs, int *save_in, int *save_out,
         }
         /* release the temporary fd / process-substitution pipe end */
         if (psub_fd >= 0) close(psub_fd);
+        if (name_owned) free((void *)name);
     }
     return 0;
+
+crd_fail:
+    if (psub_fd >= 0) close(psub_fd);
+    if (name_owned) free((void *)name);
+    return -1;
 }
 
 static void pop_compound_redirs(int save_in, int save_out, int save_err) {

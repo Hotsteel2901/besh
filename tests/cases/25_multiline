@@ -1,0 +1,22 @@
+for i in 1 2 3
+do
+  echo "for:$i"
+done
+i=0
+while [ $i -lt 2 ]
+do
+  echo "while:$i"
+  i=$((i+1))
+done
+if true
+then
+  echo "if-then"
+fi
+f() {
+  echo "func-ok"
+}
+f
+case abc in
+  a*) echo "case-ok" ;;
+  *)  echo "case-no" ;;
+esac

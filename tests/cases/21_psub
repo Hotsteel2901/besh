@@ -1,0 +1,12 @@
+set +e
+cat <(echo one)
+cat <(echo a) <(echo b)
+diff <(echo x) <(echo x) && echo SAME
+diff <(echo x) <(echo y) || echo DIFF
+wc -l < <(printf "1\n2\n3\n")
+sort <(printf "c\na\nb\n")
+while read -r l; do echo "GOT:$l"; done < <(printf "p\nq\n")
+echo z > >(cat)
+sleep 0.2
+cat <(echo nested $(echo sub))
+echo "$(cat <(echo inner))"

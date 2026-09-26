@@ -8,9 +8,10 @@
 - **Hero** — ASCII logo、标签语、技术徽章（bash / fish / zsh / autosuggest…）
 - **交互终端** — 可输入命令的演示终端，带 **fish 风格语法高亮** 与
   **自动建议**（输入前缀后按 `→` 接受），演示 `abbr`、`{1..5}`、`setopt`、
-  `pushd` / `dirs` 等新特性
-- **特性区** — `/core`（bash 兼容核心）与 `/fish + zsh`（现代特性）两组卡片
-- **内建命令网格** — 38 个内建命令（含 abbr / pushd / dirs / setopt…）
+  `pushd` / `dirs`、进程替换、`fc`、可编程补全等特性
+- **特性区** — `/core`（bash 兼容核心，含进程替换、花括号组、复合重定向）
+  与 `/fish + zsh`（现代特性）两组卡片
+- **内建命令网格** — 44 个内建命令（含 fc / compgen / complete / declare / local …）
 - **迷你游戏** — PacEat、SpeedType、AsciiRain、TowerDefense
 - **3D AST 可视化** — React Three Fiber 渲染的抽象语法树
 - **基准面板** — 真实代码行数 / 内建命令数 / 二进制体积等统计

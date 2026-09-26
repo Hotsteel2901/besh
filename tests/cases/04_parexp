@@ -1,0 +1,4 @@
+x=f.txt
+echo ${x%.*}
+echo ${x#*.}
+echo ${x/f/F}

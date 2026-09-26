@@ -23,7 +23,7 @@ jobs:
       - name: Build (warnings are treated as failures)
         run: |
           make clean
-          make CFLAGS='-Wall -Wextra -O2 -g -Wno-format-truncation -Werror'
+          make CFLAGS='-Wall -Wextra -O2 -g -Werror'
 
       - name: Differential suite (bash vs besh)
         run: tests/run.sh

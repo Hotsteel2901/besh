@@ -2,7 +2,7 @@
 # ================================================================
 
 CC      := gcc
-CFLAGS  := -Wall -Wextra -O2 -g -Wno-format-truncation
+CFLAGS  := -Wall -Wextra -O2 -g
 LDFLAGS :=
 LDLIBS  :=
 

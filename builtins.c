@@ -1547,6 +1547,7 @@ static void gen_commands(CandList *l, const char *prefix) {
 static void gen_files(CandList *l, const char *prefix, int dirs_only) {
     char dir[MAX_PATH];
     char lead[MAX_PATH + 2] = "";   /* the part of prefix we reproduce */
+    char full[MAX_PATH * 2];        /* dir + '/' + a full name_max component */
     const char *base = prefix;
     const char *slash = strrchr(prefix, '/');
     if (slash) {
@@ -1578,7 +1579,6 @@ static void gen_files(CandList *l, const char *prefix, int dirs_only) {
             if (bl == 0 || base[0] != '.') continue;
         }
         if (strncmp(e->d_name, base, bl) != 0) continue;
-        char full[MAX_PATH];
         snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
         struct stat st;
         int isdir = (stat(full, &st) == 0 && S_ISDIR(st.st_mode));

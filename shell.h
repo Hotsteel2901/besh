@@ -32,6 +32,7 @@
  * ------------------------------------------------------------------- */
 #define MAX_ARGS        2048
 #define MAX_PATH        4096
+#define MAX_CWD         (MAX_PATH * 4)   /* room for a "~/..." prefix expansion */
 #define MAX_PSUB        128   /* pending process-substitution children */
 #define MAX_LINE        65536
 #define MAX_HISTORY     2000

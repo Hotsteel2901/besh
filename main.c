@@ -2383,7 +2383,7 @@ static void prompt_render(const char *fmt, char *out, size_t outsz) {
     int root = (geteuid() == 0);
 
     const char *cwd = sh->cwd;
-    char tilde_cwd[MAX_PATH] = "";
+    char tilde_cwd[MAX_CWD] = "";
     const char *home = sh_getenv("HOME");
     if (home && strncmp(cwd, home, strlen(home)) == 0 &&
         (cwd[strlen(home)] == '/' || cwd[strlen(home)] == '\0')) {

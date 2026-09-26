@@ -676,6 +676,13 @@ static char *expand_braced(const char **pp) {
     {
         int set;
         result = param_get(name, &set);
+        /* set -u: `${VAR}` on an unset variable is an unbound-variable
+         * error too.  `${VAR:-def}`, `${VAR+def}` and the array/@ forms are
+         * handled earlier and legitimately tolerate an empty value. */
+        if (!set && sh->opt_nounset && name[0] && !has_sub) {
+            fprintf(stderr, "besh: %s: unbound variable\n", name);
+            sh->exit_request = 1;
+        }
     }
 
 done:
@@ -837,6 +844,13 @@ static char *var_expand_one(const char **pp) {
     *pp = p;
     if (nlen == 0) return sh_strdup("$");  /* bare $ */
     char *val = sh_getenv(name);
+    /* set -u: referencing an unset variable is an error.  bash still
+     * exits the shell/script rather than substituting an empty word. */
+    if (!val && sh->opt_nounset && name[0]) {
+        fprintf(stderr, "besh: %s: unbound variable\n", name);
+        sh->exit_request = 1;
+        return sh_strdup("");
+    }
     return sh_strdup(val ? val : "");
 }
 
@@ -888,18 +902,46 @@ static char *command_substitute(const char *cmd) {
     return result;
 }
 
-/* ---- arithmetic expansion: simple recursive-descent evaluator -- */
+/* ---- arithmetic expansion: recursive-descent evaluator ----------
+ * Precedence, lowest first (C-like, matching bash):
+ *   ,   ?:   ||   &&   |   ^   &   ==  !=   <  <= >  >=
+ *   <<  >>   +  -   *  /  %   **   unary + - ! ~   primary
+ * The old evaluator only understood + - * / % and stopped at the first
+ * comparison, so `$((1<2))` yielded 1 and leaked `<2))` as literal text.
+ */
 static void arith_skip(const char **p) {
     while (**p == ' ' || **p == '\t') (*p)++;
 }
 
-static long arith_expr(const char **p);
+static long arith_comma(const char **p);
+
+/* Equality / relational / bitwise / logical operators are spelled with
+ * `<`, `>` and `&`, which the lexer would otherwise take for redirection —
+ * so the whole `$((...))` is copied verbatim before this runs.  Still, we
+ * must strip any escaping the token layer added. */
+static int arith_match(const char **p, const char *op) {
+    arith_skip(p);
+    size_t n = strlen(op);
+    if (strncmp(*p, op, n) != 0) return 0;
+    /* don't match `<` when the text is actually `<<` or `<=` */
+    if (op[0] == '<' || op[0] == '>') {
+        char prev = (n >= 2) ? op[n - 1] : '\0';
+        char next = (*p)[n];
+        if (n == 1 && (next == op[0] || next == '=')) return 0;
+        (void)prev;
+    }
+    if (op[0] == '=' && n == 1 && (*p)[1] == '=') return 0;  /* == is its own */
+    if (op[0] == '&' && n == 1 && (*p)[1] == '&') return 0;
+    if (op[0] == '|' && n == 1 && (*p)[1] == '|') return 0;
+    *p += n;
+    return 1;
+}
 
 static long arith_primary(const char **p) {
     arith_skip(p);
     if (**p == '(') {
         (*p)++;
-        long v = arith_expr(p);
+        long v = arith_comma(p);
         arith_skip(p);
         if (**p == ')') (*p)++;
         return v;
@@ -907,6 +949,7 @@ static long arith_primary(const char **p) {
     if (**p == '-') { (*p)++; return -arith_primary(p); }
     if (**p == '+') { (*p)++; return  arith_primary(p); }
     if (**p == '!') { (*p)++; return !arith_primary(p); }
+    if (**p == '~') { (*p)++; return ~arith_primary(p); }
 
     /* number literal (decimal, hex, octal) */
     if (**p >= '0' && **p <= '9') {
@@ -919,6 +962,7 @@ static long arith_primary(const char **p) {
     /* variable name → look up and convert to integer */
     char name[256];
     int nlen = 0;
+    const char *save = *p;
     while ((**p >= 'a' && **p <= 'z') || (**p >= 'A' && **p <= 'Z') ||
            (**p >= '0' && **p <= '9') || **p == '_') {
         if (nlen < 255) name[nlen++] = **p;
@@ -928,28 +972,164 @@ static long arith_primary(const char **p) {
     if (nlen > 0) {
         char *val = sh_getenv(name);
         if (val && *val) return strtol(val, NULL, 0);
+        return 0;
     }
+    *p = save;
+    if (**p) (*p)++;        /* unknown char — consume so we always advance */
     return 0;
 }
 
-static long arith_mul(const char **p) {
+/* ** (right-associative, binds tighter than unary on the left) */
+static long arith_pow(const char **p) {
     long v = arith_primary(p);
+    arith_skip(p);
+    if ((*p)[0] == '*' && (*p)[1] == '*') {
+        *p += 2;
+        long e = arith_pow(p);            /* right associative */
+        long r = 1;
+        if (e < 0) return 0;
+        for (long i = 0; i < e; i++) r *= v;
+        return r;
+    }
+    return v;
+}
+
+static long arith_mul(const char **p) {
+    long v = arith_pow(p);
     for (;;) {
         arith_skip(p);
-        if (**p == '*') { (*p)++; v *= arith_primary(p); }
-        else if (**p == '/') { (*p)++; long r = arith_primary(p); v = r ? v / r : 0; }
-        else if (**p == '%') { (*p)++; long r = arith_primary(p); v = r ? v % r : 0; }
+        if      (**p == '*') { (*p)++; v *= arith_pow(p); }
+        else if (**p == '/') { (*p)++; long r = arith_pow(p); v = (r && r != -1) ? v / r : 0; }
+        else if (**p == '%') { (*p)++; long r = arith_pow(p); v = (r && r != -1) ? v % r : 0; }
         else break;
     }
     return v;
 }
 
-static long arith_expr(const char **p) {
+static long arith_add(const char **p) {
     long v = arith_mul(p);
     for (;;) {
         arith_skip(p);
-        if      (**p == '+') { (*p)++; v += arith_mul(p); }
+        if (**p == '+') { (*p)++; v += arith_mul(p); }
         else if (**p == '-') { (*p)++; v -= arith_mul(p); }
+        else break;
+    }
+    return v;
+}
+
+static long arith_shift(const char **p) {
+    long v = arith_add(p);
+    for (;;) {
+        arith_skip(p);
+        if ((*p)[0] == '<' && (*p)[1] == '<') { *p += 2; v <<= arith_add(p); }
+        else if ((*p)[0] == '>' && (*p)[1] == '>') { *p += 2; v >>= arith_add(p); }
+        else break;
+    }
+    return v;
+}
+
+static long arith_rel(const char **p) {
+    long v = arith_shift(p);
+    for (;;) {
+        arith_skip(p);
+        if ((*p)[0] == '<' && (*p)[1] == '=') { *p += 2; v = (v <= arith_shift(p)); }
+        else if ((*p)[0] == '>' && (*p)[1] == '=') { *p += 2; v = (v >= arith_shift(p)); }
+        else if ((*p)[0] == '<' && (*p)[1] != '<' && (*p)[1] != '=') { (*p)++; v = (v <  arith_shift(p)); }
+        else if ((*p)[0] == '>' && (*p)[1] != '>' && (*p)[1] != '=') { (*p)++; v = (v >  arith_shift(p)); }
+        else break;
+    }
+    return v;
+}
+
+static long arith_eq(const char **p) {
+    long v = arith_rel(p);
+    for (;;) {
+        arith_skip(p);
+        if ((*p)[0] == '=' && (*p)[1] == '=') { *p += 2; v = (v == arith_rel(p)); }
+        else if ((*p)[0] == '!' && (*p)[1] == '=') { *p += 2; v = (v != arith_rel(p)); }
+        else break;
+    }
+    return v;
+}
+
+static long arith_band(const char **p) {
+    long v = arith_eq(p);
+    for (;;) {
+        arith_skip(p);
+        if (**p == '&' && (*p)[1] != '&') { (*p)++; v &= arith_eq(p); }
+        else break;
+    }
+    return v;
+}
+
+static long arith_bxor(const char **p) {
+    long v = arith_band(p);
+    for (;;) {
+        arith_skip(p);
+        if (**p == '^') { (*p)++; v ^= arith_band(p); }
+        else break;
+    }
+    return v;
+}
+
+static long arith_bor(const char **p) {
+    long v = arith_bxor(p);
+    for (;;) {
+        arith_skip(p);
+        if (**p == '|' && (*p)[1] != '|') { (*p)++; v |= arith_bxor(p); }
+        else break;
+    }
+    return v;
+}
+
+/* && and || yield 1/0 like bash; both sides are evaluated (no short circuit
+ * needed for correctness here, but bash does short-circuit — honour it for
+ * side-effect-free expressions it is unobservable either way). */
+static long arith_land(const char **p) {
+    long v = arith_bor(p);
+    for (;;) {
+        arith_skip(p);
+        if ((*p)[0] == '&' && (*p)[1] == '&') {
+            *p += 2;
+            long r = arith_bor(p);
+            v = (v && r) ? 1 : 0;
+        } else break;
+    }
+    return v;
+}
+
+static long arith_lor(const char **p) {
+    long v = arith_land(p);
+    for (;;) {
+        arith_skip(p);
+        if ((*p)[0] == '|' && (*p)[1] == '|') {
+            *p += 2;
+            long r = arith_land(p);
+            v = (v || r) ? 1 : 0;
+        } else break;
+    }
+    return v;
+}
+
+static long arith_ternary(const char **p) {
+    long c = arith_lor(p);
+    arith_skip(p);
+    if (**p == '?') {
+        (*p)++;
+        long a = arith_comma(p);
+        arith_skip(p);
+        if (**p == ':') (*p)++;
+        long b = arith_comma(p);
+        return c ? a : b;
+    }
+    return c;
+}
+
+static long arith_comma(const char **p) {
+    long v = arith_ternary(p);
+    for (;;) {
+        arith_skip(p);
+        if (**p == ',') { (*p)++; v = arith_ternary(p); }
         else break;
     }
     return v;
@@ -996,7 +1176,7 @@ char *expand_string(const char *str) {
         /* arithmetic expansion: $(( ... )) */
         if (*p == '$' && *(p+1) == '(' && *(p+2) == '(') {
             p += 3;                       /* skip '$((' */
-            long val = arith_expr(&p);
+            long val = arith_comma(&p);
             arith_skip(&p);
             if (*p == ')') p++;          /* skip first ')' */
             if (*p == ')') p++;          /* skip second ')' */
@@ -1117,6 +1297,97 @@ static int has_unescaped_glob(const char *s) {
         if (*p == '*' || *p == '?' || *p == '[') return 1;
     }
     return 0;
+}
+
+/* Expand a string WITHOUT word splitting, brace expansion or pathname
+ * expansion — the result is always exactly one word.  This is what
+ * `[[ a == b ]]`, `case` words and assignment right-hand sides need:
+ * there, a space or a `*` is data, not a separator or a glob.
+ * Quote protection is resolved, so `[[ "a b" == "a b" ]]` works. */
+char *expand_string_no_split(const char *str) {
+    char *expanded = expand_string(str);
+    if (!expanded) return sh_strdup("");
+    /* strip quote-protection backslashes but keep glob metacharacters
+     * literal by escaping them again for the caller's comparison stage */
+    char *out = unescape_word(expanded);
+    free(expanded);
+    return out;
+}
+
+/* ---- process substitution ------------------------------------- */
+/* A `<(...)` / `>(...)` construct reaches us as a word whose first byte
+ * is \002 (input) or \003 (output) and whose remaining text is the whole
+ * construct, e.g. `<(sort f)`.  We fork a child that runs the inner list
+ * with one end of a pipe wired to its stdout (for `<(...)`) or stdin (for
+ * `>(...)`), then hand the caller a /dev/fd/N pathname that opens the
+ * other end.
+ *
+ * The child is not waited for; it is reaped by the background-job
+ * machinery.  Its pid is stored so the plumbing in executor.c can keep
+ * the job table consistent. */
+
+/* Quote a pathname the way /dev/fd/N needs: it never contains anything
+ * shell-special, so a plain copy is enough. */
+static char *psub_make_path(int fd) {
+    char *p = sh_malloc(32);
+    snprintf(p, 32, "/dev/fd/%d", fd);
+    return p;
+}
+
+/* Expand a process-substitution word.  On success returns a malloc'd
+ * pathname and sets *pid; on failure returns NULL. */
+char *expand_process_sub(const char *word, int *pid) {
+    int is_input = (word[0] == '\002');
+    const char *code = word + 1;
+    /* `code` looks like `<(list)` — drop the two leading marker chars */
+    if (code[0] != '<' && code[0] != '>') return NULL;
+    if (code[1] != '(') return NULL;
+
+    size_t clen = strlen(code);
+    if (clen < 3 || code[clen - 1] != ')') return NULL;
+    char *inner = sh_strndup(code + 2, clen - 3);
+
+    int pfd[2];
+    if (pipe(pfd) < 0) { perror("pipe"); free(inner); return NULL; }
+
+    int parent_fd, child_fd, child_target;
+    if (is_input) {
+        /* child writes to stdout → pipe; parent reads via parent_fd */
+        child_fd    = pfd[1];
+        parent_fd   = pfd[0];
+        child_target = STDOUT_FILENO;
+    } else {
+        /* child reads stdin from pipe; parent writes via parent_fd */
+        child_fd    = pfd[0];
+        parent_fd   = pfd[1];
+        child_target = STDIN_FILENO;
+    }
+
+    fflush(NULL);
+    pid_t cpid = fork();
+    if (cpid < 0) {
+        perror("fork");
+        close(pfd[0]); close(pfd[1]); free(inner);
+        return NULL;
+    }
+    if (cpid == 0) {
+        /* child: wire the pipe end to the target fd, close the other end */
+        dup2(child_fd, child_target);
+        close(pfd[0]);
+        close(pfd[1]);
+        Shell *sh = shell_get();
+        sh->job_interactive = 0;
+        int rc = execute_string(inner);
+        fflush(NULL);
+        _exit(rc);
+    }
+
+    /* parent: close the child's end, keep ours open */
+    close(child_fd);
+    free(inner);
+
+    if (pid) *pid = (int)cpid;
+    return psub_make_path(parent_fd);
 }
 
 /* remove *all* quote-protection backslashes from a lexer token.
@@ -1481,6 +1752,38 @@ char **expand_words_q(char **words, int *quoted, int *count) {
     for (int i = 0; i < *count; i++) {
         int q = quoted ? quoted[i] : 0;
 
+        /* A `[[ ... ]]` condition arrives as one pre-lexed word carrying a
+         * \001 marker (see lex_double_bracket in lexer.c).  It must pass
+         * through byte-for-byte: expanding or splitting it here would
+         * destroy the operators and the whitespace the evaluator needs. */
+        if (words[i] && words[i][0] == '\001') {
+            if (nresult < MAX_ARGS - 1)
+                result[nresult++] = sh_strdup(words[i]);
+            continue;
+        }
+
+        /* A `<(...)` / `>(...)` construct arrives as one opaque word whose
+         * first byte is \002 or \003 (see lex_process_sub).  Fork the inner
+         * list now and replace the word with a /dev/fd/N pathname. */
+        if (words[i] && (words[i][0] == '\002' || words[i][0] == '\003')) {
+            int pspid = -1;
+            char *path = expand_process_sub(words[i], &pspid);
+            if (path) {
+                if (pspid > 0) {
+                    Shell *shp = shell_get();
+                    if (shp->npsub < MAX_PSUB) {
+                        shp->psub_pids[shp->npsub] = pspid;
+                        shp->npsub++;
+                    }
+                }
+                if (nresult < MAX_ARGS - 1) result[nresult++] = path;
+                else free(path);
+            } else if (nresult < MAX_ARGS - 1) {
+                result[nresult++] = sh_strdup("/dev/null");
+            }
+            continue;
+        }
+
         /* an unquoted array reference expands to several words */
         if (find_array_ref(words[i])) {
             expand_array_token(sh, words[i], q, result, &nresult);
@@ -1579,6 +1882,17 @@ static void strlist_add(StrList *sl, const char *s) {
     sl->items[sl->count++] = sh_strdup(s);
 }
 
+/* bash presents glob matches in sorted (byte) order; readdir order is
+ * filesystem-dependent, so sort before returning them. */
+static int strlist_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static void strlist_sort(StrList *sl) {
+    if (sl->count > 1)
+        qsort(sl->items, (size_t)sl->count, sizeof(char *), strlist_cmp);
+}
+
 /* join base + name handling leading-slash base correctly */
 static void path_join(char *out, size_t outsz, const char *base, const char *name) {
     if (!base || !*base)
@@ -1599,21 +1913,49 @@ static void globstar_walk(const char *base, char **parts, int nparts, int idx,
     const char *part = parts[idx];
 
     if (strcmp(part, "**") == 0) {
-        /* zero directories then the rest of the pattern */
-        globstar_walk(base, parts, nparts, idx + 1, out);
-        /* one or more directories: descend into every subdir */
-        DIR *d = opendir(*base ? base : ".");
-        if (!d) return;
-        struct dirent *e;
-        while ((e = readdir(d))) {
-            if (e->d_name[0] == '.') continue;
+        /* bash globstar: a leading double-star component followed by more
+         * pattern matches one or more directory levels.  The zero-level
+         * case only applies when the double-star is the LAST component,
+         * where it stands for the directory itself plus everything below.
+         * The old code always tried the zero-directory branch, so a
+         * pattern like double-star + slash + name also matched plain
+         * names in the current directory. */
+        if (idx == nparts - 1) {
+            /* Trailing double-star: every entry at this level and below.
+             * bash does NOT include the starting directory itself for a
+             * bare pattern, so only emit real entries. */
+            DIR *d = opendir(*base ? base : ".");
+            if (!d) return;
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (e->d_name[0] == '.') continue;
+                char path[MAX_PATH];
+                path_join(path, sizeof(path), base, e->d_name);
+                strlist_add(out, path);
+                struct stat st;
+                if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+                    globstar_walk(path, parts, nparts, idx, out);
+            }
+            closedir(d);
+            return;
+        }
+        /* double-star followed by more pattern: it must consume AT LEAST
+         * one directory level.  Try the remainder against every directory
+         * at this level, then recurse for deeper levels. */
+        DIR *d2 = opendir(*base ? base : ".");
+        if (!d2) return;
+        struct dirent *e2;
+        while ((e2 = readdir(d2))) {
+            if (e2->d_name[0] == '.') continue;
             struct stat st;
             char path[MAX_PATH];
-            path_join(path, sizeof(path), base, e->d_name);
-            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
-                globstar_walk(path, parts, nparts, idx, out);
+            path_join(path, sizeof(path), base, e2->d_name);
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                globstar_walk(path, parts, nparts, idx + 1, out);  /* here   */
+                globstar_walk(path, parts, nparts, idx, out);      /* deeper */
+            }
         }
-        closedir(d);
+        closedir(d2);
         return;
     }
 
@@ -1677,6 +2019,7 @@ static char **globstar_glob(const char *pattern, int *count) {
     free(copy);
 
     if (out.count == 0) { *count = 0; free(out.items); return NULL; }
+    strlist_sort(&out);
     out.items[out.count] = NULL;
     *count = out.count;
     return out.items;

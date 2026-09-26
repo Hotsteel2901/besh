@@ -70,6 +70,7 @@ void ast_free(ASTNode *node) {
         ast_free(node->left);
         break;
     case NODE_SUBSHELL:
+    case NODE_BRACEGROUP:
         ast_free(node->left);
         break;
     case NODE_FUNCDEF:
@@ -120,6 +121,7 @@ void ast_print(ASTNode *node, int indent) {
     case NODE_OR:       printf("OR\n"); break;
     case NODE_BG:       printf("BG\n"); break;
     case NODE_SUBSHELL: printf("SUBSHELL\n"); break;
+    case NODE_BRACEGROUP: printf("BRACEGROUP\n"); break;
     case NODE_IF:       printf("IF\n"); break;
     case NODE_FOR:      printf("FOR\n"); break;
     case NODE_WHILE:    printf("WHILE\n"); break;
@@ -150,7 +152,10 @@ static Redir *parse_redirection(Lexer *l) {
 
     /* check if there is an fd number before the operator */
     int fd_num = -1;
-    if (l->token_type == TOK_WORD) {
+    if (l->token_fd >= 0) {
+        /* the lexer recognized `N>` / `N<` and put the number on the token */
+        fd_num = l->token_fd;
+    } else if (l->token_type == TOK_WORD) {
         char *end;
         long val = strtol(l->token_text, &end, 10);
         if (*end == '\0' && end != l->token_text) {
@@ -186,10 +191,85 @@ static Redir *parse_redirection(Lexer *l) {
         r->type = REDIR_ERRAPPEND;
         r->src_fd = STDERR_FILENO;
         break;
-    case TOK_BOTHREDIR:
+    case TOK_BOTHREDIR: {
+        /* Two spellings share the `>&` token:
+         *   `> file`   — send stdout AND stderr to `file`
+         *   `> N`      — duplicate fd N onto stdout (`-` closes it)
+         * `2>&1` arrives as TOK_WORD "2" followed by this token, so
+         * fd_num holds the fd being redirected.  The two forms are told
+         * apart by peeking at the word that follows: a bare run of digits
+         * means "duplicate", anything else is a filename. */
+        int fd_src = (fd_num >= 0) ? fd_num : STDOUT_FILENO;
+
+        /* `&>` (the & came first) always means "both to file"; only the
+         * `> &` spelling can be a duplicate.  The lexer reports the fd
+         * via token_fd for `N>&`, and the text starts with '>' for a
+         * bare `>&`. */
+        if (l->token_text[0] == '>' || fd_num >= 0) {   /* dup possible */
+            int save_pos = l->pos;
+            int save_type = l->token_type;
+            int save_quoted = l->token_quoted;
+            char *save_text = sh_strdup(l->token_text);
+            lexer_next(l);
+
+            if (l->token_type == TOK_WORD) {
+                const char *t = l->token_text;
+                const char *d = (*t == '-') ? t + 1 : t;
+                if (*d && strspn(d, "0123456789") == strlen(d)) {
+                    int close_it = (*t == '-');
+                    r->type  = close_it ? REDIR_CLOSE : REDIR_DUPOUT;
+                    r->src_fd = fd_src;
+                    r->fd    = close_it ? -1 : atoi(d);
+                    free(r->filename);
+                    r->filename = NULL;
+                    lexer_next(l);
+                    return r;
+                }
+            }
+            /* not a dup — rewind so the word is read as a filename */
+            free(l->token_text);
+            l->token_text = save_text;
+            l->pos = save_pos;
+            l->token_type = save_type;
+            l->token_quoted = save_quoted;
+        }
+
         r->type = REDIR_BOTH;
         r->src_fd = -1;  /* both stdout and stderr */
         break;
+    }
+    case TOK_ERRDUP: {
+        /* `2>&N` — duplicate fd N onto stderr.  Handled like the `>&N`
+         * case: peek at the following word. */
+        int save_pos = l->pos;
+        int save_type = l->token_type;
+        int save_quoted = l->token_quoted;
+        char *save_text = sh_strdup(l->token_text);
+        lexer_next(l);
+
+        if (l->token_type == TOK_WORD) {
+            const char *t = l->token_text;
+            const char *d = (*t == '-') ? t + 1 : t;
+            if (*d && strspn(d, "0123456789") == strlen(d)) {
+                int close_it = (*t == '-');
+                r->type   = close_it ? REDIR_CLOSE : REDIR_DUPOUT;
+                r->src_fd = STDERR_FILENO;
+                r->fd     = close_it ? -1 : atoi(d);
+                r->filename = NULL;
+                lexer_next(l);
+                return r;
+            }
+        }
+        /* not a dup — treat `2>&` like `2>` with a filename */
+        free(l->token_text);
+        l->token_text = save_text;
+        l->pos = save_pos;
+        l->token_type = save_type;
+        l->token_quoted = save_quoted;
+        r->type = REDIR_ERR;
+        r->src_fd = STDERR_FILENO;
+        break;
+    }
     case TOK_DLESS:
         r->type = REDIR_HEREDOC;
         r->src_fd = (fd_num >= 0) ? fd_num : STDIN_FILENO;
@@ -225,6 +305,12 @@ static Redir *parse_redirection(Lexer *l) {
         if (l->token_type != TOK_WORD) {
             fprintf(stderr, "besh: parse error: expected filename after redirection\n");
             r->filename = sh_strdup("/dev/null");
+        } else if (l->token_text[0] == '\002' || l->token_text[0] == '\003') {
+            /* process substitution used as the redirection target:
+             * `cmd > >(sink)` / `cmd < <(source)`.  Keep the marker so
+             * the executor can fork the inner list at run time instead
+             * of trying to open the literal text as a pathname. */
+            r->filename = sh_strdup(l->token_text);
         } else {
             r->filename = unescape_token(l->token_text);
         }
@@ -250,6 +336,7 @@ static ASTNode *parse_simple_command(Lexer *l) {
         if (l->token_type == TOK_LREDIR || l->token_type == TOK_RREDIR ||
             l->token_type == TOK_APPEND || l->token_type == TOK_RREDIR2 ||
             l->token_type == TOK_ERRREDIR || l->token_type == TOK_ERRAPPEND ||
+            l->token_type == TOK_ERRDUP ||
             l->token_type == TOK_BOTHREDIR ||
             l->token_type == TOK_DLESS || l->token_type == TOK_DLESSDASH) {
 
@@ -335,6 +422,38 @@ static ASTNode *parse_simple_command(Lexer *l) {
     return node;
 }
 
+/* Redirections may follow a compound command as well as a simple one:
+ *
+ *     while read -r l; do ...; done < "$file"
+ *     for i in a b; do ...; done > out.log
+ *     { echo hi; } 2>&1
+ *
+ * The compound parsers (parse_if/for/while/case/funcdef/subshell) leave the
+ * lexer sitting on whatever follows their closing keyword, so a redirection
+ * that belongs to the whole construct is still unread at that point.  This
+ * helper collects it and hangs it off the node, where execute_node_internal
+ * applies it around the body.  It is a no-op for nodes that already own the
+ * redirection (simple commands parse their own). */
+static void parse_compound_redirs(Lexer *l, ASTNode *node) {
+    if (!node) return;
+    Redir *last = NULL;
+    for (Redir *r = node->redirs; r; r = r->next) last = r;
+
+    while (l->token_type == TOK_LREDIR || l->token_type == TOK_RREDIR ||
+           l->token_type == TOK_APPEND || l->token_type == TOK_RREDIR2 ||
+           l->token_type == TOK_ERRREDIR || l->token_type == TOK_ERRAPPEND ||
+            l->token_type == TOK_ERRDUP ||
+           l->token_type == TOK_BOTHREDIR ||
+           l->token_type == TOK_DLESS || l->token_type == TOK_DLESSDASH) {
+
+        Redir *r = parse_redirection(l);
+        if (!r) break;
+        if (!node->redirs) node->redirs = r;
+        else last->next = r;
+        last = r;
+    }
+}
+
 /* ---- parse a command: simple_command | subshell | funcdef | if | for | while -- */
 static ASTNode *parse_command(Lexer *l) {
     ASTNode *node = NULL;
@@ -348,6 +467,22 @@ static ASTNode *parse_command(Lexer *l) {
             lexer_next(l);
         else
             fprintf(stderr, "besh: expected )\n");
+        parse_compound_redirs(l, node);
+        return node;
+    }
+
+    if (l->token_type == TOK_LBRACE) {
+        /* brace group: { list; } — runs in the current shell, unlike a
+         * subshell.  The closing brace must be preceded by a `;` or
+         * newline; parse_list stops at the TOK_RBRACE token. */
+        lexer_next(l);
+        node = ast_new(NODE_BRACEGROUP);
+        node->left = parse_list(l);
+        if (l->token_type == TOK_RBRACE)
+            lexer_next(l);
+        else
+            fprintf(stderr, "besh: expected }\n");
+        parse_compound_redirs(l, node);
         return node;
     }
 
@@ -357,20 +492,28 @@ static ASTNode *parse_command(Lexer *l) {
         /* check for reserved words */
         if (strcmp(word, "if") == 0) {
             free(word);
-            return parse_if(l);
+            node = parse_if(l);
+            parse_compound_redirs(l, node);
+            return node;
         }
         if (strcmp(word, "for") == 0) {
             free(word);
-            return parse_for(l);
+            node = parse_for(l);
+            parse_compound_redirs(l, node);
+            return node;
         }
         if (strcmp(word, "while") == 0 || strcmp(word, "until") == 0) {
             int is_until = (strcmp(word, "until") == 0);
             free(word);
-            return parse_while(l, is_until);
+            node = parse_while(l, is_until);
+            parse_compound_redirs(l, node);
+            return node;
         }
         if (strcmp(word, "case") == 0) {
             free(word);
-            return parse_case(l);
+            node = parse_case(l);
+            parse_compound_redirs(l, node);
+            return node;
         }
         if (strcmp(word, "function") == 0) {
             free(word);
@@ -509,6 +652,7 @@ static ASTNode *parse_list(Lexer *l) {
             left = bg;
             /* if there's a command after &, start a new list */
             if (l->token_type != TOK_EOF && l->token_type != TOK_RPAREN &&
+                l->token_type != TOK_RBRACE &&
                 l->token_type != TOK_NEWLINE && l->token_type != TOK_SEMI &&
                 l->token_type != TOK_DSEMI && !is_clause_terminator(l)) {
                 ASTNode *right = parse_and_or(l);
@@ -522,11 +666,13 @@ static ASTNode *parse_list(Lexer *l) {
 
         /* trailing separator — ignore */
         if (l->token_type == TOK_EOF || l->token_type == TOK_RPAREN ||
+            l->token_type == TOK_RBRACE ||
             l->token_type == TOK_DSEMI || is_clause_terminator(l))
             break;
 
         /* ; or newline — sequential execution */
         if (l->token_type != TOK_EOF && l->token_type != TOK_RPAREN &&
+            l->token_type != TOK_RBRACE &&
             l->token_type != TOK_DSEMI && !is_clause_terminator(l)) {
             ASTNode *right = parse_and_or(l);
             ASTNode *list = ast_new(NODE_LIST);
@@ -747,8 +893,10 @@ static ASTNode *parse_funcdef(Lexer *l, char *name) {
     ASTNode *node = ast_new(NODE_FUNCDEF);
     node->func_name = name;
 
-    /* expect { */
-    if (l->token_type == TOK_WORD && strcmp(l->token_text, "{") == 0)
+    /* expect { — either its own token (TOK_LBRACE) or, for compatibility
+     * with the older lexer, a plain WORD "{" */
+    if (l->token_type == TOK_LBRACE ||
+        (l->token_type == TOK_WORD && strcmp(l->token_text, "{") == 0))
         lexer_next(l);
     else {
         fprintf(stderr, "besh: expected '{' in function definition\n");
@@ -759,7 +907,8 @@ static ASTNode *parse_funcdef(Lexer *l, char *name) {
     node->func_body = parse_list(l);
 
     /* expect } */
-    if (l->token_type == TOK_WORD && strcmp(l->token_text, "}") == 0)
+    if (l->token_type == TOK_RBRACE ||
+        (l->token_type == TOK_WORD && strcmp(l->token_text, "}") == 0))
         lexer_next(l);
     /* also accept TOK_RPAREN for compatibility */
     else if (l->token_type == TOK_RPAREN) {

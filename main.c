@@ -1746,8 +1746,45 @@ int sh_input_incomplete(const char *input) {
     char last_word[128];
     last_word[0] = '\0';
 
+    /* Redirection operators already seen for the command being scanned.
+     * `&>`/`>&`/`>|` are complete on their own; a bare `>`/`<` opens a slot
+     * for the target word, which may turn out to be a heredoc delimiter. */
+    /* Pending here-document awaiting its body.  A single `<<` operator may
+     * declare more than one here-doc on one line (`cat <<A <<B`), so this is
+     * a bounded FIFO of delimiters. */
+    char hd_delim[4][128];
+    int  hd_strip[4];
+    int  hd_n = 0;          /* delimiters queued, not yet satisfied */
+    int  hd_head = 0;       /* current delimiter index              */
+    int  hd_scan = 0;       /* 1 = we are consuming a here-doc body */
+
     for (int i = 0; i < n; i++) {
         char c = input[i];
+
+        /* ---- inside a here-document body ---------------------------- */
+        if (hd_scan) {
+            int ls = i;
+            while (i + 1 < n && input[i] != '\n') i++;
+            if (input[i] != '\n') break;          /* body still open */
+            int le = i;                           /* exclusive end    */
+            const char *body = input + ls;
+            int blen = le - ls;
+            if (hd_strip[hd_head]) {              /* <<- skips tabs   */
+                while (blen > 0 && *body == '\t') { body++; blen--; }
+            }
+            int dlen = (int)strlen(hd_delim[hd_head]);
+            if (blen == dlen && memcmp(body, hd_delim[hd_head],
+                                       (size_t)dlen) == 0) {
+                /* this body is closed — move on to the next queued one */
+                hd_head++;
+                if (hd_head >= hd_n) {            /* all closed       */
+                    hd_n = hd_head = 0;
+                    hd_scan = 0;
+                }
+            }
+            /* a non-matching line simply belongs to the here-doc body */
+            continue;
+        }
 
         if (esc) {
             esc = 0;
@@ -1765,7 +1802,12 @@ int sh_input_incomplete(const char *input) {
         }
         if (c == '\\') { esc = 1; continue; }
         if (c == '\'') {
-            word[wl] = '\0'; incompleteness_word(word, &n_if, &n_fi, &n_do,
+            word[wl] = '\0';
+            if (hd_n > hd_head && hd_delim[hd_n - 1][0] == '\0' && wl) {
+                /* a quoted delimiter disables expansion inside the body */
+                snprintf(hd_delim[hd_n - 1], sizeof(hd_delim[0]), "%s", word);
+            }
+            incompleteness_word(word, &n_if, &n_fi, &n_do,
                 &n_done, &n_case, &n_esac, &cmd_pos, &last_op);
             if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
             wl = 0;
@@ -1773,7 +1815,11 @@ int sh_input_incomplete(const char *input) {
             continue;
         }
         if (c == '"') {
-            word[wl] = '\0'; incompleteness_word(word, &n_if, &n_fi, &n_do,
+            word[wl] = '\0';
+            if (hd_n > hd_head && hd_delim[hd_n - 1][0] == '\0' && wl) {
+                snprintf(hd_delim[hd_n - 1], sizeof(hd_delim[0]), "%s", word);
+            }
+            incompleteness_word(word, &n_if, &n_fi, &n_do,
                 &n_done, &n_case, &n_esac, &cmd_pos, &last_op);
             if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
             wl = 0;
@@ -1786,11 +1832,19 @@ int sh_input_incomplete(const char *input) {
         }
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
             word[wl] = '\0';
+            if (hd_n > hd_head && hd_delim[hd_n - 1][0] == '\0' && wl)
+                snprintf(hd_delim[hd_n - 1], sizeof(hd_delim[0]), "%s", word);
             incompleteness_word(word, &n_if, &n_fi, &n_do, &n_done,
                 &n_case, &n_esac, &cmd_pos, &last_op);
             if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
             wl = 0;
-            if (c == '\n') { cmd_pos = 1; last_op = 0; }
+            if (c == '\n') {
+                /* a `<<` operator whose delimiter never appeared is a
+                 * syntax error, not a continuation — drop the queue */
+                if (hd_n > hd_head && hd_delim[hd_n - 1][0] == '\0') hd_n = hd_head;
+                cmd_pos = 1; last_op = 0;
+                if (hd_n > hd_head) hd_scan = 1;   /* body starts next line */
+            }
             continue;
         }
         /* operators */
@@ -1818,13 +1872,53 @@ int sh_input_incomplete(const char *input) {
         if (c == '}') { if (brace > 0) brace--; cmd_pos = 0; last_op = 0; continue; }
         if (c == ';') { cmd_pos = 1; last_op = 0; continue; }
 
+        /* redirection operators — `<<` never matches `<<<` (here-string,
+         * which has no body and therefore needs no continuation) */
+        if (c == '<' && i + 2 < n && input[i + 1] == '<' &&
+            input[i + 2] == '<') {
+            i += 2;                       /* consume "<<<" */
+            wl = 0;                       /* its word is not a delimiter */
+            cmd_pos = 0; last_op = 0;
+            continue;
+        }
+        if (c == '<' && i + 1 < n && input[i + 1] == '<') {
+            i++;                          /* consume "<<"  */
+            if (i + 1 < n && input[i + 1] == '-') { i++; hd_strip[hd_n] = 1; }
+            else hd_strip[hd_n] = 0;
+            hd_delim[hd_n][0] = '\0';
+            wl = 0;                       /* start collecting the delimiter word */
+            hd_n++;                       /* bounded below by the queue size */
+            cmd_pos = 0; last_op = 0;
+            continue;
+        }
+        if (c == '>') {
+            if (i + 1 < n && input[i + 1] == '>') i++;        /* >>  */
+            else if (i + 1 < n && input[i + 1] == '|') i++;    /* >|  */
+            wl = 0;
+            cmd_pos = 0; last_op = 0;
+            continue;
+        }
+        if (c == '<') {
+            wl = 0;                       /* plain input redirection */
+            cmd_pos = 0; last_op = 0;
+            continue;
+        }
+
         if (wl < (int)sizeof(word) - 1) word[wl++] = c;
     }
     word[wl] = '\0';
+    /* a `<<` delimiter that ran to end-of-input still counts */
+    if (hd_n > hd_head && hd_delim[hd_n - 1][0] == '\0' && wl)
+        snprintf(hd_delim[hd_n - 1], sizeof(hd_delim[0]), "%s", word);
     incompleteness_word(word, &n_if, &n_fi, &n_do, &n_done, &n_case,
                         &n_esac, &cmd_pos, &last_op);
     if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
     trailing_esc = esc;
+
+    /* An unterminated here-document keeps the input open.  This is what
+     * makes multi-line scripts and `source` work: the reader must not hand
+     * a `cat <<EOF` line to the parser before its body has arrived. */
+    if (hd_n > 0) return 1;
 
     if (in_s || in_d) return 2;
     if (trailing_esc || paren > 0 || brace > 0 || last_op) return 1;
@@ -2372,10 +2466,16 @@ int sh_run_stream(FILE *f) {
 
         prev_kind = sh_input_incomplete(acc);
         if (prev_kind == 0) {
+            sh->in_condition = 0;      /* never leak condition state */
             ret = execute_string(acc);
             free(acc);
             acc = NULL;
             acclen = 0;
+            /* `set -e`: a failing statement ends the whole script */
+            if (sh->exit_request) {
+                sh->exit_request = 0;
+                break;
+            }
             /* a `return` in a sourced file stops the remaining statements */
             if (sh->return_request) {
                 sh->return_request = 0;
@@ -2451,6 +2551,14 @@ int main(int argc, char **argv) {
         sh->job_interactive = 0;
         set_positional(argv, argc, 3, "besh");
         int ret = execute_string(argv[2]);
+        /* `set -e` must leave a non-zero status behind: unwind() only
+         * skips the *remaining* statements, the last status is still the
+         * failure that triggered the exit (bash exits with that code). */
+        if (sh->exit_request) {
+            sh->exit_request = 0;
+            if (ret == 0) ret = sh->exit_status;
+            if (ret == 0) ret = 1;
+        }
         shell_destroy();
         return ret;
     }
@@ -2469,7 +2577,11 @@ int main(int argc, char **argv) {
 
     /* interactive mode */
     if (!sh->job_interactive) {
-        /* stdin is not a tty — read all input at once */
+        /* stdin is not a tty — read all input at once, then run it through
+         * the streaming executor.  Going through sh_run_stream() (rather
+         * than a single execute_string call) is what makes `set -e` able
+         * to abandon the remaining statements and keeps multi-line
+         * constructs and here-documents working for piped input. */
         char *buf = NULL;
         size_t cap = 0, len = 0;
         char chunk[8192];
@@ -2485,7 +2597,13 @@ int main(int argc, char **argv) {
         int ret = 0;
         if (buf && len > 0) {
             buf[len] = '\0';
-            ret = execute_string(buf);
+            FILE *mem = fmemopen(buf, len, "r");
+            if (mem) {
+                ret = sh_run_stream(mem);
+                fclose(mem);
+            } else {
+                ret = execute_string(buf);
+            }
         }
         free(buf);
         shell_destroy();
@@ -2588,9 +2706,15 @@ int main(int argc, char **argv) {
             int saved_jc = sh->job_interactive;
             sh->job_interactive = 0;
             term_restore();
+            sh->in_condition = 0;     /* never leak condition state */
             sh->exit_status = execute_string(trimmed);
             sh->job_interactive = saved_jc;
             sh->return_request = 0;   /* drop a stray top-level return */
+            /* `set -e` at the top level leaves the shell, like bash -e */
+            if (sh->exit_request) {
+                sh->exit_request = 0;
+                sh->running = 0;
+            }
         }
         free(dup);
     }

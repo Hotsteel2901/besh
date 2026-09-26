@@ -21,6 +21,38 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
 static int wait_for_pid(pid_t pid);
 static int setup_redirections(Redir *redirs);
 
+/* A redirection target may itself be a process substitution
+ * (`cmd > >(sink)` / `cmd < <(source)`).  Such a filename is kept by the
+ * parser with a leading \002 / \003 marker; fork the inner list here and
+ * return the /dev/fd/N pathname the redirection should actually open.
+ * For ordinary filenames the input pointer is returned unchanged.
+ *
+ * *psub_fd receives the raw descriptor when a process substitution was
+ * created, or -1 otherwise.  The caller is responsible for closing it:
+ * bash keeps the pipe end only long enough for the redirection to be
+ * installed, and leaking it would keep the writer's pipe from ever
+ * seeing EOF (so the next `while ... < <(...)` would read nothing). */
+static const char *redir_resolve_name(const char *name, int *psub_fd) {
+    if (psub_fd) *psub_fd = -1;
+    if (name && (name[0] == '\002' || name[0] == '\003')) {
+        int pid = -1;
+        char *path = expand_process_sub(name, &pid);
+        if (path) {
+            Shell *sh = shell_get();
+            if (pid > 0 && sh->npsub < MAX_PSUB)
+                sh->psub_pids[sh->npsub++] = pid;
+            if (psub_fd) {
+                /* the pathname is /dev/fd/N — recover N */
+                const char *slash = strrchr(path, '/');
+                if (slash && slash[1]) *psub_fd = atoi(slash + 1);
+            }
+            return path;                 /* freed by the caller after use */
+        }
+        return "/dev/null";
+    }
+    return name;
+}
+
 /* ---- job management ------------------------------------------ */
 void job_add(pid_t pgid, pid_t *pids, int npids, const char *cmd) {
     Shell *sh = shell_get();
@@ -179,12 +211,14 @@ static int setup_redirections(Redir *redirs) {
 
     for (Redir *r = redirs; r; r = r->next) {
         int fd = -1;
+        int psub_fd = -1;
         int target_fd = (r->src_fd >= 0) ? r->src_fd : STDOUT_FILENO;
+        const char *rname = redir_resolve_name(r->filename, &psub_fd);
 
         switch (r->type) {
         case REDIR_IN:
-            fd = open(r->filename, O_RDONLY);
-            if (fd < 0) { perror(r->filename); return -1; }
+            fd = open(rname, O_RDONLY);
+            if (fd < 0) { perror(rname); return -1; }
             dup2(fd, target_fd);
             close(fd);
             break;
@@ -192,44 +226,44 @@ static int setup_redirections(Redir *redirs) {
         case REDIR_OUT: {
             int flags = O_WRONLY | O_CREAT | O_TRUNC;
             if (sh->opt_noclobber) flags |= O_EXCL;
-            fd = open(r->filename, flags, 0644);
-            if (fd < 0) { perror(r->filename); return -1; }
+            fd = open(rname, flags, 0644);
+            if (fd < 0) { perror(rname); return -1; }
             dup2(fd, target_fd);
             close(fd);
             break;
         }
 
         case REDIR_APPEND:
-            fd = open(r->filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (fd < 0) { perror(r->filename); return -1; }
+            fd = open(rname, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd < 0) { perror(rname); return -1; }
             dup2(fd, target_fd);
             close(fd);
             break;
 
         case REDIR_CLOBBER:
-            fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) { perror(r->filename); return -1; }
+            fd = open(rname, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { perror(rname); return -1; }
             dup2(fd, target_fd);
             close(fd);
             break;
 
         case REDIR_ERR:
-            fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) { perror(r->filename); return -1; }
+            fd = open(rname, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { perror(rname); return -1; }
             dup2(fd, STDERR_FILENO);
             close(fd);
             break;
 
         case REDIR_ERRAPPEND:
-            fd = open(r->filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (fd < 0) { perror(r->filename); return -1; }
+            fd = open(rname, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd < 0) { perror(rname); return -1; }
             dup2(fd, STDERR_FILENO);
             close(fd);
             break;
 
         case REDIR_BOTH:
-            fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) { perror(r->filename); return -1; }
+            fd = open(rname, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { perror(rname); return -1; }
             dup2(fd, STDOUT_FILENO);
             dup2(fd, STDERR_FILENO);
             close(fd);
@@ -254,9 +288,30 @@ static int setup_redirections(Redir *redirs) {
             break;
         }
 
+        case REDIR_DUPIN:
+            /* <&n — duplicate fd n onto the target */
+            dup2(r->fd, target_fd);
+            break;
+
+        case REDIR_DUPOUT:
+            /* >&n — duplicate fd n onto the target */
+            dup2(r->fd, target_fd);
+            break;
+
+        case REDIR_CLOSE:
+            /* >&- / <&- — close the target fd */
+            close(target_fd);
+            break;
+
         default:
             break;
         }
+
+        /* The redirection is installed on its target fd now, so the
+         * temporary descriptor (and the pipe end behind a process
+         * substitution) can be released.  Keeping it open would stop the
+         * writer from ever seeing EOF. */
+        if (psub_fd >= 0) close(psub_fd);
     }
 
     return 0;
@@ -476,41 +531,83 @@ int execute_command(ASTNode *node) {
 
     /* check builtins */
     builtin_fn bf = builtin_lookup(cmd_argv[0]);
+    /* a `[[ ... ]]` condition word (marker \001) is handled by builtin_test
+     * regardless of its literal text */
+    if (!bf && cmd_argv[0] && cmd_argv[0][0] == '\001')
+        bf = builtin_lookup("test");
     if (bf) {
         /* handle redirections for builtins */
         int saved_stdin = -1, saved_stdout = -1, saved_stderr = -1;
 
         /* set up redirections */
         for (Redir *r = node->redirs; r; r = r->next) {
+            int bpsub_fd = -1;
+            const char *rname = redir_resolve_name(r->filename, &bpsub_fd);
             switch (r->type) {
             case REDIR_IN:
                 if (saved_stdin < 0) saved_stdin = dup(STDIN_FILENO);
-                { int fd = open(r->filename, O_RDONLY);
+                { int fd = open(rname, O_RDONLY);
                   if (fd >= 0) { dup2(fd, STDIN_FILENO); close(fd); } }
                 break;
             case REDIR_OUT:
                 if (saved_stdout < 0) saved_stdout = dup(STDOUT_FILENO);
-                { int fd = open(r->filename, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                { int fd = open(rname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
                   if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); } }
                 break;
             case REDIR_APPEND:
                 if (saved_stdout < 0) saved_stdout = dup(STDOUT_FILENO);
-                { int fd = open(r->filename, O_WRONLY|O_CREAT|O_APPEND, 0644);
+                { int fd = open(rname, O_WRONLY|O_CREAT|O_APPEND, 0644);
                   if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); } }
                 break;
             case REDIR_ERR:
                 if (saved_stderr < 0) saved_stderr = dup(STDERR_FILENO);
-                { int fd = open(r->filename, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                { int fd = open(rname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
                   if (fd >= 0) { dup2(fd, STDERR_FILENO); close(fd); } }
                 break;
             case REDIR_BOTH:
                 if (saved_stdout < 0) saved_stdout = dup(STDOUT_FILENO);
                 if (saved_stderr < 0) saved_stderr = dup(STDERR_FILENO);
-                { int fd = open(r->filename, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                { int fd = open(rname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
                   if (fd >= 0) { dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); } }
+                break;
+            case REDIR_ERRAPPEND:
+                if (saved_stderr < 0) saved_stderr = dup(STDERR_FILENO);
+                { int fd = open(rname, O_WRONLY|O_CREAT|O_APPEND, 0644);
+                  if (fd >= 0) { dup2(fd, STDERR_FILENO); close(fd); } }
+                break;
+            case REDIR_CLOBBER:
+                if (saved_stdout < 0) saved_stdout = dup(STDOUT_FILENO);
+                { int fd = open(rname, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                  if (fd >= 0) { dup2(fd, STDOUT_FILENO); close(fd); } }
+                break;
+            case REDIR_DUPIN:
+            case REDIR_DUPOUT:
+                if (r->src_fd == STDIN_FILENO) {
+                    if (saved_stdin < 0) saved_stdin = dup(STDIN_FILENO);
+                    dup2(r->fd, STDIN_FILENO);
+                } else if (r->src_fd == STDERR_FILENO) {
+                    if (saved_stderr < 0) saved_stderr = dup(STDERR_FILENO);
+                    dup2(r->fd, STDERR_FILENO);
+                } else {
+                    if (saved_stdout < 0) saved_stdout = dup(STDOUT_FILENO);
+                    dup2(r->fd, STDOUT_FILENO);
+                }
+                break;
+            case REDIR_CLOSE:
+                if (r->src_fd == STDIN_FILENO) {
+                    if (saved_stdin < 0) saved_stdin = dup(STDIN_FILENO);
+                    close(STDIN_FILENO);
+                } else if (r->src_fd == STDERR_FILENO) {
+                    if (saved_stderr < 0) saved_stderr = dup(STDERR_FILENO);
+                    close(STDERR_FILENO);
+                } else {
+                    if (saved_stdout < 0) saved_stdout = dup(STDOUT_FILENO);
+                    close(STDOUT_FILENO);
+                }
                 break;
             default: break;
             }
+            if (bpsub_fd >= 0) close(bpsub_fd);
         }
 
         int ret = bf(cmd_argc, cmd_argv);
@@ -710,7 +807,26 @@ int execute_pipeline(ASTNode *pipeline) {
                 fprintf(stderr, "besh: %s: %s\n", ex[0], strerror(errno));
                 _exit(127);
             }
-            _exit(0);
+
+            /* Anything that is not a simple command — a while/for/if/
+             * case/group/subshell/function call — used to fall through to
+             * the _exit(0) below and silently do nothing, which broke the
+             * very common `producer | while read l; do ... done` idiom.
+             * Run it here in the forked child instead: the process already
+             * has the right stdin/stdout wired to the pipe, and exiting
+             * afterwards gives the pipeline its left-to-right semantics.
+             * NB: only commands running in a child may run here — a
+             * non-async child inherits parent memory but that is fine, its
+             * results are discarded like any other pipeline stage. */
+            {
+                /* never hijack the shell while it is interactive here */
+                int saved_jc = sh->job_interactive;
+                sh->job_interactive = 0;
+                int r = execute_node_internal(cmds[i], NULL, NULL, 0);
+                sh->job_interactive = saved_jc;
+                fflush(NULL);
+                _exit(r);
+            }
         }
         pids[i] = pid;
 
@@ -735,9 +851,11 @@ int execute_pipeline(ASTNode *pipeline) {
 
     /* wait for all children */
     int last_status = 0;
+    int pipefail_status = 0;      /* last non-zero, for set -o pipefail */
     for (int i = 0; i < ncmds; i++) {
         int status = wait_for_pid(pids[i]);
         if (i == ncmds - 1) last_status = status;
+        if (status != 0) pipefail_status = status;
     }
 
     /* restore foreground */
@@ -745,20 +863,148 @@ int execute_pipeline(ASTNode *pipeline) {
         tcsetpgrp(sh->term_fd, sh->shell_pgid);
     }
 
+    /* `set -o pipefail`: the pipeline fails if ANY stage failed, using the
+     * right-most non-zero status — plain bash semantics. */
+    if (sh->opt_pipefail && pipefail_status != 0)
+        last_status = pipefail_status;
+
     sh->exit_status = last_status;
     return last_status;
 }
 
 /* ---- internal execution dispatcher --------------------------- */
+/* Compound commands can carry redirections too (`while ...; done < f`,
+ * `{ ...; } 2>&1`, `for i in ...; do ...; done > out`).  They must apply
+ * for the whole construct, so they are installed before the body runs and
+ * undone afterwards — unlike a simple command, which keeps them for the
+ * lifetime of its forked child.
+ *
+ * Returns 0 on success (the saved fds are written to *save_in/out/err, -1
+ * when not saved), or -1 if a redirection could not be opened. */
+static int push_compound_redirs(Redir *redirs, int *save_in, int *save_out,
+                                int *save_err) {
+    *save_in = *save_out = *save_err = -1;
+    if (!redirs) return 0;
+
+    for (Redir *r = redirs; r; r = r->next) {
+        int psub_fd = -1;
+        const char *name = redir_resolve_name(r->filename, &psub_fd);
+        switch (r->type) {
+        case REDIR_IN:
+            if (*save_in < 0) *save_in = dup(STDIN_FILENO);
+            { int fd = open(name, O_RDONLY);
+              if (fd < 0) { perror(name); return -1; }
+              dup2(fd, STDIN_FILENO); close(fd); }
+            break;
+        case REDIR_OUT:
+        case REDIR_CLOBBER:
+            if (*save_out < 0) *save_out = dup(STDOUT_FILENO);
+            { int fd = open(name, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+              if (fd < 0) { perror(name); return -1; }
+              dup2(fd, STDOUT_FILENO); close(fd); }
+            break;
+        case REDIR_APPEND:
+            if (*save_out < 0) *save_out = dup(STDOUT_FILENO);
+            { int fd = open(name, O_WRONLY|O_CREAT|O_APPEND, 0644);
+              if (fd < 0) { perror(name); return -1; }
+              dup2(fd, STDOUT_FILENO); close(fd); }
+            break;
+        case REDIR_ERR:
+            if (*save_err < 0) *save_err = dup(STDERR_FILENO);
+            { int fd = open(name, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+              if (fd < 0) { perror(name); return -1; }
+              dup2(fd, STDERR_FILENO); close(fd); }
+            break;
+        case REDIR_ERRAPPEND:
+            if (*save_err < 0) *save_err = dup(STDERR_FILENO);
+            { int fd = open(name, O_WRONLY|O_CREAT|O_APPEND, 0644);
+              if (fd < 0) { perror(name); return -1; }
+              dup2(fd, STDERR_FILENO); close(fd); }
+            break;
+        case REDIR_BOTH:
+            if (*save_out < 0) *save_out = dup(STDOUT_FILENO);
+            if (*save_err < 0) *save_err = dup(STDERR_FILENO);
+            { int fd = open(name, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+              if (fd < 0) { perror(name); return -1; }
+              dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO); close(fd); }
+            break;
+        case REDIR_DUPIN:
+        case REDIR_DUPOUT: {
+            int tf = (r->src_fd == STDIN_FILENO)  ? STDIN_FILENO
+                   : (r->src_fd == STDERR_FILENO) ? STDERR_FILENO
+                                                  : STDOUT_FILENO;
+            if (tf == STDIN_FILENO)       { if (*save_in  < 0) *save_in  = dup(tf); }
+            else if (tf == STDERR_FILENO) { if (*save_err < 0) *save_err = dup(tf); }
+            else                          { if (*save_out < 0) *save_out = dup(tf); }
+            dup2(r->fd, tf);
+            break;
+        }
+        case REDIR_CLOSE: {
+            int tf = (r->src_fd == STDIN_FILENO)  ? STDIN_FILENO
+                   : (r->src_fd == STDERR_FILENO) ? STDERR_FILENO
+                                                  : STDOUT_FILENO;
+            if (tf == STDIN_FILENO)       { if (*save_in  < 0) *save_in  = dup(tf); }
+            else if (tf == STDERR_FILENO) { if (*save_err < 0) *save_err = dup(tf); }
+            else                          { if (*save_out < 0) *save_out = dup(tf); }
+            close(tf);
+            break;
+        }
+        default:
+            break;
+        }
+        /* release the temporary fd / process-substitution pipe end */
+        if (psub_fd >= 0) close(psub_fd);
+    }
+    return 0;
+}
+
+static void pop_compound_redirs(int save_in, int save_out, int save_err) {
+    if (save_in  >= 0) { dup2(save_in,  STDIN_FILENO);  close(save_in);  }
+    if (save_out >= 0) { dup2(save_out, STDOUT_FILENO); close(save_out); }
+    if (save_err >= 0) { dup2(save_err, STDERR_FILENO); close(save_err); }
+}
+
 static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
                                  int async) {
     Shell *sh = shell_get();
     if (!node) return 0;
 
+    /* Set by constructs that are inherently exempt from errexit (&& / ||
+     * lists, `!` pipelines).  Reaching the generic check below with
+     * `sh->exit_request` set means a *nested* construct that IS subject
+     * to errexit failed, so the request must survive.  Clearing it here
+     * instead would silently disable `set -e` for everything below. */
+    int exempt_errexit = 0;
+
     /* `return` unwinds the current function body / sourced file */
     if (sh->return_request) return sh->exit_status;
 
     int ret = 0;
+
+    /* Compound commands carry their own redirections; install them for the
+     * whole construct.  Simple commands handle redirections internally
+     * (possibly in a forked child), so they are excluded here. */
+    int cr_in = -1, cr_out = -1, cr_err = -1;
+    int cr_active = 0;
+    switch (node->type) {
+    case NODE_WHILE:
+    case NODE_FOR:
+    case NODE_IF:
+    case NODE_CASE:
+    case NODE_SUBSHELL:
+    case NODE_BRACEGROUP:
+        if (node->redirs) {
+            if (push_compound_redirs(node->redirs, &cr_in, &cr_out, &cr_err) < 0) {
+                pop_compound_redirs(cr_in, cr_out, cr_err);
+                sh->exit_status = 1;
+                return 1;
+            }
+            cr_active = 1;
+        }
+        break;
+    default:
+        break;
+    }
 
     switch (node->type) {
 
@@ -774,28 +1020,59 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
         ret = execute_pipeline(node);
         break;
 
-    case NODE_LIST:
+    case NODE_LIST: {
+        /* Sequential list.  `a && b; c` must still run `c` even though the
+         * `&&` list came back non-zero.  The parse tree is left-nested
+         * (LIST(LIST(stmt, stmt), stmt)), so the exemption flag has to
+         * travel outward: a list whose last-executed statement was exempt
+         * is itself exempt.  Only a genuinely failing statement that is
+         * NOT exempt leaves `exit_request` set for us to honour. */
         execute_node_internal(node->left, NULL, NULL, async);
+        int left_exempt = sh->last_exempt;
+        sh->last_exempt = 0;          /* will be re-set by the right side */
         if (sh->break_request || sh->continue_request || sh->return_request)
             break;
+        if (left_exempt && sh->opt_errexit) sh->exit_request = 0;
+        if (sh->exit_request) break;
         ret = execute_node_internal(node->right, NULL, NULL, async);
+        /* `last_exempt` now describes the right operand; the generic reset
+         * below would wipe it for a non-exempt node, so make this node
+         * count as exempt when its last statement was. */
+        exempt_errexit = sh->last_exempt;
         break;
+    }
 
     case NODE_AND:
+    case NODE_OR: {
+        /* Both operands sit "in a condition", and so does the node itself:
+         * bash does not apply errexit to a command that is part of an
+         * && / || list — neither operand nor the list's own result.  The
+         * counter therefore stays raised across the whole node. */
+        int is_and = (node->type == NODE_AND);
+        sh->in_condition++;
         ret = execute_node_internal(node->left, NULL, NULL, async);
-        if (sh->return_request) break;
-        if (ret == 0) {
+        int left_status = ret;
+        if (!sh->return_request &&
+            (( is_and && ret == 0) || (!is_and && ret != 0))) {
             ret = execute_node_internal(node->right, NULL, NULL, async);
         }
-        break;
-
-    case NODE_OR:
-        ret = execute_node_internal(node->left, NULL, NULL, async);
-        if (sh->return_request) break;
+        sh->in_condition--;
+        if (sh->opt_errexit) sh->exit_request = 0;
+        exempt_errexit = 1;
+        sh->last_exempt = 1;
+        /* bash nuance: the operands of an && / || list are exempt from
+         * errexit, but the list's own failing status still counts when it
+         * is the LAST statement.  The status is exempt only when the
+         * short-circuit itself decided it — i.e. `false && x` (left failed,
+         * right never ran) stays quiet, while `true && false` (right ran
+         * and failed) aborts under set -e. */
         if (ret != 0) {
-            ret = execute_node_internal(node->right, NULL, NULL, async);
+            int decided_by_short_circuit =
+                is_and ? (left_status != 0) : (left_status == 0);
+            if (!decided_by_short_circuit) sh->last_exempt = 0;
         }
         break;
+    }
 
     case NODE_BG: {
         pid_t pid = fork();
@@ -833,8 +1110,15 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
     }
 
     case NODE_NOT: {
+        /* `! cmd` inverts the status, so a failure is expected control
+         * flow — errexit must not fire for the negated command. */
+        sh->in_condition++;
         ret = execute_node_internal(node->left, NULL, NULL, async);
+        sh->in_condition--;
+        if (sh->opt_errexit) sh->exit_request = 0;
         ret = (ret == 0) ? 1 : 0;
+        exempt_errexit = 1;
+        sh->last_exempt = 1;
         break;
     }
 
@@ -861,13 +1145,23 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
         break;
     }
 
+    case NODE_BRACEGROUP:
+        /* `{ list; }` runs in the current shell — only the redirections
+         * (if any) are scoped, and those are installed above.  This is
+         * what makes `{ cd /tmp; pwd; }` affect the parent shell while
+         * `( cd /tmp; pwd )` does not. */
+        ret = execute_node_internal(node->left, NULL, NULL, 0);
+        break;
+
     case NODE_FUNCDEF:
         /* function already registered at parse time */
         ret = 0;
         break;
 
     case NODE_IF: {
+        sh->in_condition++;          /* suppress errexit while testing */
         int cond_ret = execute_node_internal(node->cond, NULL, NULL, 0);
+        sh->in_condition--;
         if (cond_ret == 0) {
             ret = execute_node_internal(node->body, NULL, NULL, 0);
         } else if (node->else_body) {
@@ -925,12 +1219,16 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
     case NODE_WHILE: {
         int is_until = (node->argc == 1);
         while (1) {
+            sh->in_condition++;      /* suppress errexit while testing */
             int cond_ret = execute_node_internal(node->cond, NULL, NULL, 0);
+            sh->in_condition--;
             if (sh->return_request) break;
             if (is_until) { if (cond_ret == 0) break; }
             else          { if (cond_ret != 0) break; }
+            if (sh->exit_request) break;
             ret = execute_node_internal(node->body, NULL, NULL, 0);
             if (sh->return_request) break;
+            if (sh->exit_request) break;
             if (sh->break_request) {
                 sh->break_request = 0;
                 break;
@@ -973,7 +1271,35 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
         break;
     }
 
+    /* undo compound-command redirections before the status propagates, so
+     * a following statement writes to the shell's own stdout again */
+    if (cr_active) pop_compound_redirs(cr_in, cr_out, cr_err);
+
     sh->exit_status = ret;
+
+    /* ---- errexit (set -e) -------------------------------------------
+     * bash does NOT trigger this when the failing command is part of a
+     * condition (if/while/until, either operand of && / ||, or a `!`
+     * pipeline), which is what sh->in_condition tracks.  When it does
+     * fire, the shell unwinds: we flag `exit_request` so enclosing
+     * constructs stop at once and the REPL / script loop terminates. */
+    if (sh->opt_errexit && ret != 0 && sh->in_condition == 0 &&
+        !exempt_errexit &&
+        !sh->return_request && !sh->break_request && !sh->continue_request) {
+        /* a failure inside a background job or a subshell child is not a
+         * reason to kill the shell itself */
+        if (node->type != NODE_BG) {
+            sh->exit_request = 1;
+        }
+    }
+
+    /* A node that is not inherently exempt clears the exemption flag, so
+     * `false && true` followed by `echo` does not keep suppressing
+     * errexit.  Exempt nodes set the flag themselves above. */
+    if (!exempt_errexit && node->type != NODE_AND &&
+        node->type != NODE_OR && node->type != NODE_NOT)
+        sh->last_exempt = 0;
+
     return ret;
 }
 

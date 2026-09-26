@@ -8,6 +8,7 @@
 
 #include "shell.h"
 #include <ctype.h>
+#include <regex.h>
 
 /* ================================================================
  *  cd [dir]  — change working directory
@@ -605,6 +606,9 @@ static OptionEntry option_table[] = {
     {"xtrace",          offsetof(Shell, opt_xtrace)},
     {"verbose",         offsetof(Shell, opt_verbose)},
     {"noglob",          offsetof(Shell, opt_noglob)},
+    {"errexit",         offsetof(Shell, opt_errexit)},
+    {"nounset",         offsetof(Shell, opt_nounset)},
+    {"pipefail",        offsetof(Shell, opt_pipefail)},
     {NULL, 0}
 };
 
@@ -1806,6 +1810,32 @@ int builtin_set(int argc, char **argv) {
         if (strcmp(argv[i], "+C") == 0) { sh->opt_noclobber = 0; continue; }
         if (strcmp(argv[i], "-a") == 0) { sh->opt_allexport = 1; continue; }
         if (strcmp(argv[i], "+a") == 0) { sh->opt_allexport = 0; continue; }
+        if (strcmp(argv[i], "-e") == 0) { sh->opt_errexit = 1; continue; }
+        if (strcmp(argv[i], "+e") == 0) { sh->opt_errexit = 0; continue; }
+        if (strcmp(argv[i], "-u") == 0) { sh->opt_nounset = 1; continue; }
+        if (strcmp(argv[i], "+u") == 0) { sh->opt_nounset = 0; continue; }
+        /* combined single-letter flags such as `set -eu` / `set +eu` */
+        if ((argv[i][0] == '-' || argv[i][0] == '+') && argv[i][1] &&
+            argv[i][1] != '-' && strlen(argv[i]) > 2) {
+            int val = (argv[i][0] == '-');
+            int handled = 1;
+            for (int k = 1; argv[i][k]; k++) {
+                switch (argv[i][k]) {
+                case 'e': sh->opt_errexit = val; break;
+                case 'u': sh->opt_nounset = val; break;
+                case 'x': sh->opt_xtrace  = val; break;
+                case 'v': sh->opt_verbose = val; break;
+                case 'f': sh->opt_noglob  = val; break;
+                case 'a': sh->opt_allexport = val; break;
+                case 'C': sh->opt_noclobber = val; break;
+                default:
+                    fprintf(stderr, "besh: set: unknown option: -%c\n", argv[i][k]);
+                    handled = 0;
+                    break;
+                }
+            }
+            if (handled) continue;
+        }
         /* zsh-style: set -o name / set +o name */
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "+o") == 0) {
             int val = (argv[i][0] == '+') ? 0 : 1;
@@ -1846,8 +1876,30 @@ int builtin_read(int argc, char **argv) {
     }
 
     char buf[MAX_LINE];
-    if (!fgets(buf, sizeof(buf), stdin)) {
-        return 1;  /* EOF */
+    /* Read straight from fd 0 rather than through the stdio `stdin`
+     * buffer.  Redirections are installed with dup2() behind stdio's
+     * back, so a FILE * left in its end-of-file state (which is exactly
+     * what happens after a `while ... < <(...)` loop drains its pipe)
+     * would keep reporting EOF even though fd 0 now points at a fresh
+     * pipe.  Reading raw bytes avoids that stale-state trap entirely. */
+    {
+        size_t n = 0;
+        int got_any = 0;
+        while (n < sizeof(buf) - 1) {
+            char ch;
+            ssize_t r = read(STDIN_FILENO, &ch, 1);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (r == 0) break;              /* EOF */
+            got_any = 1;
+            if (ch == '\n') break;
+            buf[n++] = ch;
+        }
+        if (!got_any) return 1;             /* EOF, nothing read */
+        buf[n] = '\0';
+        /* a partial last line still counts as a line */
     }
 
     size_t len = strlen(buf);
@@ -1930,15 +1982,295 @@ static int test_unary(const char *op, const char *arg) {
     return 0;
 }
 
-int builtin_test(int argc, char **argv) {
-    /* handle the '[' form — last argument must be ']' */
-    int is_bracket = (strcmp(argv[0], "[") == 0);
-    int effective_argc = is_bracket ? argc - 2 : argc;
-    char **effective_argv = is_bracket ? argv + 1 : argv;
+/* ================================================================
+ *  [[ ... ]]  — compound conditional expression
+ *
+ *  The lexer hands us the raw text between the brackets as argv[0]
+ *  prefixed with '\001'.  Grammar (bash-compatible):
+ *
+ *    expr   := or
+ *    or     := and ( '||' and )*
+ *    and    := not ( '&&' not )*
+ *    not    := '!' not | primary
+ *    primary:= '(' expr ')'
+ *            | unary_op word
+ *            | word bin_op word        (bin_op includes =~ regex)
+ *            | word                    (true when non-empty)
+ * ================================================================ */
+typedef struct {
+    char **toks;
+    int   *quoted;      /* parallel to toks: 1 if the token was quoted */
+    int    n;
+    int    pos;
+} DBTok;
 
-    if (is_bracket && argc > 1 && strcmp(argv[argc-1], "]") != 0) {
-        fprintf(stderr, "besh: [: missing `]'\n");
+static int db_peek(DBTok *t) { return t->pos < t->n ? 1 : 0; }
+static const char *db_cur(DBTok *t) { return t->pos < t->n ? t->toks[t->pos] : NULL; }
+static int db_cur_quoted(DBTok *t) { return t->pos < t->n ? t->quoted[t->pos] : 0; }
+static void db_next(DBTok *t) { if (t->pos < t->n) t->pos++; }
+
+/* does the current token equal one of these literal operators? */
+static int db_is_op(DBTok *t, const char *a, const char *b, const char *c) {
+    const char *s = db_cur(t);
+    if (!s) return 0;
+    if (a && strcmp(s, a) == 0) return 1;
+    if (b && strcmp(s, b) == 0) return 1;
+    if (c && strcmp(s, c) == 0) return 1;
+    return 0;
+}
+
+static int db_expr(DBTok *t);
+
+/* numeric comparison used by [[ -eq ]] etc. */
+static int db_num_cmp(const char *l, const char *r, const char *op) {
+    char *e1, *e2;
+    long a = strtol(l, &e1, 10);
+    long b = strtol(r, &e2, 10);
+    if (*e1 || *e2) {                 /* not integers → false, like bash */
+        return 0;
+    }
+    if (strcmp(op, "-eq") == 0) return a == b;
+    if (strcmp(op, "-ne") == 0) return a != b;
+    if (strcmp(op, "-lt") == 0) return a <  b;
+    if (strcmp(op, "-le") == 0) return a <= b;
+    if (strcmp(op, "-gt") == 0) return a >  b;
+    if (strcmp(op, "-ge") == 0) return a >= b;
+    return 0;
+}
+
+/* [[ left =~ regex ]] — POSIX ERE via the system regex engine */
+static int db_regex_match(const char *str, const char *pat) {
+    regex_t re;
+    if (regcomp(&re, pat, REG_EXTENDED) != 0) return 0;
+    int ok = (regexec(&re, str, 0, NULL, 0) == 0);
+    regfree(&re);
+    return ok;
+}
+
+static int db_primary(DBTok *t) {
+    if (!db_peek(t)) return 0;
+    const char *s = db_cur(t);
+
+    if (strcmp(s, "(") == 0) {
+        db_next(t);
+        int v = db_expr(t);
+        if (db_is_op(t, ")", NULL, NULL)) db_next(t);
+        return v;
+    }
+
+    /* unary operators on files / strings — the table must list every op
+     * test_unary() understands, otherwise the token is taken for an
+     * operand and the expression fails to parse (`[[ -n x ]]`). */
+    if (s[0] == '-' && strlen(s) == 2 &&
+        strchr("abcdefghkLnprstuwxzGLNOSvR", s[1])) {
+        char op[3];
+        snprintf(op, sizeof(op), "%s", s);
+        db_next(t);
+        const char *arg = db_cur(t);
+        if (!arg) arg = "";
+        db_next(t);
+        return test_unary(op, arg) ? 1 : 0;
+    }
+
+    /* bare word: could be a binary expression or a plain non-empty test */
+    const char *left = s;
+    /* build the expanded form now, so `[[ $x == y ]]` compares values */
+    char *lexp = expand_string_no_split(left);
+    db_next(t);
+
+    if (db_peek(t)) {
+        const char *op = db_cur(t);
+        /* binary string operators */
+        if (strcmp(op, "==") == 0 || strcmp(op, "=") == 0 ||
+            strcmp(op, "!=") == 0 || strcmp(op, "=~") == 0 ||
+            strcmp(op, "<") == 0 || strcmp(op, ">") == 0 ||
+            strcmp(op, "-eq") == 0 || strcmp(op, "-ne") == 0 ||
+            strcmp(op, "-lt") == 0 || strcmp(op, "-le") == 0 ||
+            strcmp(op, "-gt") == 0 || strcmp(op, "-ge") == 0 ||
+            strcmp(op, "-nt") == 0 || strcmp(op, "-ot") == 0 ||
+            strcmp(op, "-ef") == 0) {
+            db_next(t);
+            const char *rtok = db_cur(t);
+            int rquoted = db_cur_quoted(t);
+            if (!rtok) rtok = "";
+            /* For == / != the RHS is a GLOB PATTERN — but only when it was
+             * not quoted.  `[[ x == "a*" ]]` compares against the literal
+             * `a*`, so escape the metacharacters in that case. */
+            char *rexp;
+            if (strcmp(op, "==") == 0 || strcmp(op, "=") == 0 ||
+                strcmp(op, "!=") == 0) {
+                if (rquoted) {
+                    /* escape every glob metacharacter so the match is literal */
+                    size_t len = strlen(rtok);
+                    char *esc = sh_malloc(len * 2 + 1);
+                    size_t o = 0;
+                    for (size_t k = 0; k < len; k++) {
+                        if (rtok[k] == '*' || rtok[k] == '?' ||
+                            rtok[k] == '[' || rtok[k] == '\\')
+                            esc[o++] = '\\';
+                        esc[o++] = rtok[k];
+                    }
+                    esc[o] = '\0';
+                    rexp = esc;
+                } else {
+                    rexp = sh_strdup(rtok);
+                }
+            } else {
+                rexp = expand_string_no_split(rtok);
+            }
+            db_next(t);
+
+            int r;
+            if (strcmp(op, "==") == 0 || strcmp(op, "=") == 0)
+                r = sh_pattern_match(lexp, rexp);
+            else if (strcmp(op, "!=") == 0)
+                r = !sh_pattern_match(lexp, rexp);
+            else if (strcmp(op, "=~") == 0)
+                r = db_regex_match(lexp, rexp);
+            else if (strcmp(op, "<") == 0)  r = strcmp(lexp, rexp) <  0;
+            else if (strcmp(op, ">") == 0)  r = strcmp(lexp, rexp) >  0;
+            else if (strcmp(op, "-nt") == 0 || strcmp(op, "-ot") == 0 ||
+                     strcmp(op, "-ef") == 0) {
+                struct stat s1, s2;
+                int ok1 = (stat(lexp, &s1) == 0);
+                int ok2 = (stat(rexp, &s2) == 0);
+                if (strcmp(op, "-ef") == 0)
+                    r = ok1 && ok2 && s1.st_dev == s2.st_dev &&
+                        s1.st_ino == s2.st_ino;
+                else if (strcmp(op, "-nt") == 0)
+                    r = ok1 && ok2 && s1.st_mtime > s2.st_mtime;
+                else
+                    r = ok1 && ok2 && s1.st_mtime < s2.st_mtime;
+            }
+            else r = db_num_cmp(lexp, rexp, op);
+
+            free(lexp); free(rexp);
+            return r;
+        }
+    }
+    int r = (*lexp != '\0');
+    free(lexp);
+    return r;
+}
+
+static int db_not(DBTok *t) {
+    if (db_is_op(t, "!", NULL, NULL)) { db_next(t); return !db_not(t); }
+    return db_primary(t);
+}
+
+static int db_and(DBTok *t) {
+    int v = db_not(t);
+    while (db_is_op(t, "&&", "-a", NULL)) { db_next(t); int r = db_not(t); v = (v && r); }
+    return v;
+}
+
+static int db_expr(DBTok *t) {
+    int v = db_and(t);
+    while (db_is_op(t, "||", "-o", NULL)) { db_next(t); int r = db_and(t); v = (v || r); }
+    return v;
+}
+
+/* Split the raw `[[` body into tokens, removing quotes and honouring
+ * backslash escapes.  Spaces separate tokens; quoting glues them.
+ * Tokens that were quoted on the right-hand side of == / != must be
+ * matched literally, so each token also records whether it was quoted. */
+static int db_tokenize(const char *s, char ***out, int **quoted_out) {
+    int cap = 16, n = 0;
+    char **v = sh_malloc((size_t)cap * sizeof(char *));
+    int  *qv = sh_malloc((size_t)cap * sizeof(int));
+    int i = 0;
+    while (s[i]) {
+        while (s[i] == ' ' || s[i] == '\t' || s[i] == '\n') i++;
+        if (!s[i]) break;
+        char *buf = sh_malloc(strlen(s) + 1);
+        int bl = 0;
+        int was_quoted = 0;
+        /* multi-character operators are handled by the quote-aware scan
+         * below; a run of operator chars becomes ONE token so that `==`,
+         * `!=`, `=~`, `&&`, `||` survive intact. */
+        while (s[i] && s[i] != ' ' && s[i] != '\t' && s[i] != '\n') {
+            char c = s[i];
+            if (c == '\\' && s[i + 1]) {
+                buf[bl++] = s[i + 1]; i += 2; was_quoted = 1; continue;
+            }
+            if (c == '\'' || c == '"') {
+                char q = c;
+                was_quoted = 1;
+                i++;
+                while (s[i] && s[i] != q) {
+                    if (q == '"' && s[i] == '\\' && s[i + 1]) {
+                        buf[bl++] = s[i + 1]; i += 2; continue;
+                    }
+                    buf[bl++] = s[i++];
+                }
+                if (s[i] == q) i++;
+                continue;
+            }
+            buf[bl++] = s[i++];
+        }
+        buf[bl] = '\0';
+        if (n >= cap) {
+            cap *= 2;
+            v  = sh_realloc(v,  (size_t)cap * sizeof(char *));
+            qv = sh_realloc(qv, (size_t)cap * sizeof(int));
+        }
+        v[n] = buf;
+        qv[n] = was_quoted;
+        n++;
+    }
+    v[n] = NULL;
+    *out = v;
+    if (quoted_out) *quoted_out = qv;
+    return n;
+}
+
+/* Evaluate a `[[ ... ]]` condition whose raw body is `cond`.
+ * Returns 0 (true) / 1 (false) to match builtin return convention. */
+static int db_evaluate(const char *cond) {
+    char **toks = NULL;
+    int   *tq   = NULL;
+    int n = db_tokenize(cond, &toks, &tq);
+    if (n == 0) { free(toks); free(tq); return 1; }   /* `[[ ]]` is false */
+    DBTok t = { toks, tq, n, 0 };
+    int r = db_expr(&t);
+    /* leftover tokens mean a syntax error: bash reports and returns 2 */
+    int leftover = (t.pos < t.n);
+    for (int i = 0; i < n; i++) free(toks[i]);
+    free(toks);
+    free(tq);
+    if (leftover) {
+        fprintf(stderr, "besh: [[: syntax error near `%s'\n", cond);
         return 2;
+    }
+    return r ? 0 : 1;
+}
+
+int builtin_test(int argc, char **argv) {
+    /* `[[ ... ]]`: the lexer passes the whole condition as one word
+     * prefixed with \001 (see lex_double_bracket). */
+    if (argc >= 1 && argv[0] && argv[0][0] == '\001') {
+        /* the condition may still have been split if it was expanded,
+         * so re-join any trailing argv entries defensively */
+        return db_evaluate(argv[0] + 1);
+    }
+
+    /* `[` is `test` with a trailing `]` and otherwise identical semantics.
+     * Both forms have the command name in argv[0], so drop exactly one
+     * leading word in each case — the old code only did this for `[` and
+     * therefore mis-counted every `test a -op b` invocation (argc 4 was
+     * never handled and fell through to the syntax-error return). */
+    int is_bracket = (strcmp(argv[0], "[") == 0);
+    int effective_argc = argc - 1;
+    char **effective_argv = argv + 1;
+
+    if (is_bracket) {
+        if (effective_argc > 0 &&
+            strcmp(effective_argv[effective_argc - 1], "]") != 0) {
+            fprintf(stderr, "besh: [: missing `]'\n");
+            return 2;
+        }
+        effective_argc--;            /* discard the closing `]` */
+        if (effective_argc < 0) effective_argc = 0;
     }
 
     if (effective_argc <= 0) {

@@ -17,6 +17,7 @@ Lexer *lexer_new(const char *input) {
     l->token_type = 0;
     l->token_text = NULL;
     l->token_quoted = 0;
+    l->token_fd = -1;
     return l;
 }
 
@@ -127,6 +128,64 @@ static void lex_copy_dollar_paren(Lexer *l, char **buf, int *blen, int *bcap) {
     for (int k = start; k < i; k++)
         lex_append_raw(buf, blen, bcap, (unsigned char)l->input[k]);
     l->pos = i;
+}
+
+/* Process substitution: <(list)  >(list)
+ *
+ * bash replaces the whole construct with a pathname (/dev/fd/N) that the
+ * command can open; the list runs asynchronously in a child with a pipe
+ * wired accordingly.  We cannot wire up the child at lex time (the fd is
+ * only known once the command actually runs), so the construct is carried
+ * through the lexer/parser verbatim as a *word* whose first character is
+ * the marker \002 (for <(...)) or \003 (for >(...)).  The expansion stage
+ * recognizes the marker and performs the fork.  Copying it as one word
+ * also keeps the inner list's spaces, pipes and redirections from being
+ * split by the ordinary word reader.
+ *
+ * Returns non-zero and advances past the construct when one is found at
+ * the current position. */
+static int lex_process_sub(Lexer *l, char **buf, int *blen, int *bcap) {
+    if (l->pos + 1 >= l->len) return 0;
+    char opener = l->input[l->pos];
+    if ((opener != '<' && opener != '>') || l->input[l->pos + 1] != '(')
+        return 0;
+
+    int i = l->pos + 2;               /* skip '<(' or '>(' */
+    int depth = 1;
+    while (i < l->len && depth > 0) {
+        char d = l->input[i];
+        if (d == '\\' && i + 1 < l->len) { i += 2; continue; }
+        if (d == '\'') {
+            i++;
+            while (i < l->len && l->input[i] != '\'') i++;
+            if (i < l->len) i++;
+            continue;
+        }
+        if (d == '"') {
+            i++;
+            while (i < l->len && l->input[i] != '"') {
+                if (l->input[i] == '\\' && i + 1 < l->len) i++;
+                i++;
+            }
+            if (i < l->len) i++;
+            continue;
+        }
+        if (d == '(') depth++;
+        else if (d == ')') { depth--; if (depth == 0) { i++; break; } }
+        i++;
+    }
+    if (depth != 0) {                 /* unterminated — treat as plain text */
+        fprintf(stderr, "besh: unterminated process substitution\n");
+        return 0;
+    }
+
+    /* marker + the whole `X(...)` construct, kept verbatim */
+    lex_append_raw(buf, blen, bcap, (unsigned char)(opener == '<' ? '\002' : '\003'));
+    for (int k = l->pos; k < i; k++)
+        lex_append_raw(buf, blen, bcap, (unsigned char)l->input[k]);
+    l->pos = i;
+    l->token_quoted = 1;              /* never glob/split the placeholder */
+    return 1;
 }
 
 /* Copy a whole `${ ... }` parameter expansion verbatim and advance past it.
@@ -371,6 +430,12 @@ static char *read_word(Lexer *l) {
             continue;
         }
 
+        /* process substitution <(...) / >(...) — one opaque word */
+        if ((c == '<' || c == '>') && l->pos + 1 < l->len &&
+            l->input[l->pos + 1] == '(') {
+            if (lex_process_sub(l, &buf, &blen, &bcap)) continue;
+        }
+
         /* handle backtick command substitution inside a word */
         if (c == '`') {
             int start = l->pos;
@@ -515,10 +580,111 @@ char *lexer_heredoc(Lexer *l, const char *delim, int strip_tabs) {
  *  l->token_text (caller should NOT free it — it is owned by the
  *  lexer and overwritten on next call).
  * ================================================================ */
+
+/* Scan a whole `[[ ... ]]` condition into l->token_text.
+ *
+ * The text kept is everything BETWEEN the brackets, verbatim (no
+ * unescaping, no quoting removal) — builtin_test re-parses it.  Nesting
+ * of `(`/`)` is tracked so a `]]` inside a parenthesised sub-condition is
+ * not mistaken for the terminator, and quotes suspend all matching.
+ * A missing `]]` is reported and the rest of the input is consumed, which
+ * keeps the REPL from spinning on an unrecoverable token. */
+static void lex_double_bracket(Lexer *l) {
+    l->pos += 2;                    /* skip '[[' */
+
+    char *buf = sh_malloc(256);
+    int blen = 0, bcap = 256;
+    int depth = 0;
+
+    for (;;) {
+        /* Look past any blanks: they are only real separators when they
+         * sit between two operands.  Leading padding (right after `[[`)
+         * and trailing padding (before `]]`) must be dropped, and blanks
+         * must never be inserted between the characters of one operand. */
+        int probe = l->pos;
+        while (probe < l->len &&
+               (l->input[probe] == ' ' || l->input[probe] == '\t'))
+            probe++;
+        int skipped_blanks = (probe > l->pos);
+
+        if (probe >= l->len) {
+            fprintf(stderr, "besh: [[: missing `]]'\n");
+            break;
+        }
+        if (l->input[probe] == '\n') { l->pos = probe + 1; l->lineno++; continue; }
+
+        /* `]]` at nesting depth zero closes the condition */
+        if (depth == 0 && l->input[probe] == ']' &&
+            probe + 1 < l->len && l->input[probe + 1] == ']') {
+            l->pos = probe + 2;
+            break;
+        }
+
+        /* a real operand separator: emit exactly one space, and only if
+         * something has already been written */
+        if (skipped_blanks && blen > 0)
+            lex_append_raw(&buf, &blen, &bcap, ' ');
+        l->pos = probe;
+
+        char d = l->input[l->pos];
+        if (d == '\\' && l->pos + 1 < l->len) {
+            lex_append_raw(&buf, &blen, &bcap, '\\');
+            lex_append_raw(&buf, &blen, &bcap, (unsigned char)l->input[l->pos + 1]);
+            l->pos += 2;
+            continue;
+        }
+        if (d == '\'') {                 /* single quotes: keep verbatim    */
+            lex_append_raw(&buf, &blen, &bcap, '\'');
+            l->pos++;
+            while (l->pos < l->len && l->input[l->pos] != '\'') {
+                lex_append_raw(&buf, &blen, &bcap, (unsigned char)l->input[l->pos]);
+                l->pos++;
+            }
+            if (l->pos < l->len) { lex_append_raw(&buf, &blen, &bcap, '\''); l->pos++; }
+            l->token_quoted = 1;
+            continue;
+        }
+        if (d == '"') {                  /* double quotes: keep verbatim    */
+            lex_append_raw(&buf, &blen, &bcap, '"');
+            l->pos++;
+            while (l->pos < l->len && l->input[l->pos] != '"') {
+                if (l->input[l->pos] == '\\' && l->pos + 1 < l->len) {
+                    lex_append_raw(&buf, &blen, &bcap, '\\');
+                    lex_append_raw(&buf, &blen, &bcap, (unsigned char)l->input[l->pos + 1]);
+                    l->pos += 2;
+                    continue;
+                }
+                lex_append_raw(&buf, &blen, &bcap, (unsigned char)l->input[l->pos]);
+                l->pos++;
+            }
+            if (l->pos < l->len) { lex_append_raw(&buf, &blen, &bcap, '"'); l->pos++; }
+            continue;
+        }
+        if (d == '(') { depth++; l->token_quoted = 1; }
+        else if (d == ')') { if (depth > 0) depth--; l->token_quoted = 1; }
+        lex_append_raw(&buf, &blen, &bcap, (unsigned char)d);
+        l->pos++;
+    }
+
+    buf[blen] = '\0';
+    /* Prefix the condition with a marker so builtin_test can tell a
+     * `[[ expr ]]` word apart from a plain argument.  The marker is a
+     * control character that cannot appear in normal shell input. */
+    {
+        char *marked = sh_malloc((size_t)blen + 2);
+        marked[0] = '\001';
+        memcpy(marked + 1, buf, (size_t)blen + 1);
+        free(buf);
+        l->token_text = marked;
+    }
+    l->token_type = TOK_WORD;
+}
+
 int lexer_next(Lexer *l) {
     free(l->token_text);
     l->token_text = NULL;
     l->token_quoted = 0;
+    l->token_fd = -1;
 
     lexer_skip_whitespace(l);
 
@@ -535,6 +701,22 @@ int lexer_next(Lexer *l) {
     }
 
     char c = l->input[l->pos];
+
+    /* `[[ ... ]]` — a single compound token.
+     * The body is scanned as one word here because the operators inside
+     * (`<`, `>`, `&&`, `||`, `(`, `)`) are shell metacharacters that must
+     * NOT be interpreted as redirection / control operators.  The parser
+     * receives it as one word whose text is the condition, and builtin_test
+     * evaluates it.  Whitespace inside is preserved so the evaluator can
+     * tokenise it itself. */
+    if (c == '[' && l->pos + 1 < l->len && l->input[l->pos + 1] == '[' &&
+        (l->pos + 2 >= l->len ||
+         l->input[l->pos + 2] == ' ' || l->input[l->pos + 2] == '\t' ||
+         l->input[l->pos + 2] == '\n')) {
+        lex_double_bracket(l);
+        l->token_type = TOK_WORD;
+        return TOK_WORD;
+    }
 
     /* newline — return as TOK_NEWLINE, but skip consecutive ones */
     if (c == '\n') {
@@ -598,8 +780,86 @@ int lexer_next(Lexer *l) {
         return TOK_PIPE;
     }
 
+    /* process substitution: <(...) / >(...)
+     * Must be tested before the redirection branches below, since both
+     * start with the same characters.  read_word() copies the whole
+     * construct verbatim and marks it with a leading \002 / \003. */
+    if ((c == '<' || c == '>') && l->pos + 1 < l->len &&
+        l->input[l->pos + 1] == '(') {
+        int save = l->pos;
+        l->token_text = read_word(l);
+        if (l->token_text[0] == '\002' || l->token_text[0] == '\003') {
+            l->token_type = TOK_WORD;
+            return TOK_WORD;
+        }
+        /* not a real substitution (unterminated) — rewind and let the
+         * redirection branches handle it */
+        free(l->token_text);
+        l->token_text = NULL;
+        l->pos = save;
+    }
+
+    /* generic fd-prefixed redirection: N>, N>>, N<, N>&, N<&, N>|
+     * (`2>` and `2>>` are covered here too — they are just N=2, and are
+     * reported with their own token types for backward compatibility.)
+     * The fd number is carried on the token text so the parser can pick
+     * it up without re-scanning the input. */
+    if (c >= '0' && c <= '9') {
+        int p = l->pos;
+        while (p < l->len && l->input[p] >= '0' && l->input[p] <= '9') p++;
+        if (p < l->len && (l->input[p] == '>' || l->input[p] == '<')) {
+            int fdlen = p - l->pos;
+            int fdnum = atoi(l->input + l->pos);
+            char dir = l->input[p];
+            p++;
+
+            char tokbuf[24];
+            /* N>& / N<& : duplicate a fd */
+            if (p < l->len && l->input[p] == '&') {
+                p++;
+                l->pos = p;
+                snprintf(tokbuf, sizeof(tokbuf), "%d%c&", fdnum, dir);
+                l->token_text = sh_strdup(tokbuf);
+                l->token_fd = fdnum;
+                l->token_type = (fdnum == 2) ? TOK_ERRDUP : TOK_BOTHREDIR;
+                return l->token_type;
+            }
+            /* N>> : append */
+            if (dir == '>' && p < l->len && l->input[p] == '>') {
+                p++;
+                l->pos = p;
+                l->token_fd = fdnum;
+                l->token_type = (fdnum == 2) ? TOK_ERRAPPEND : TOK_APPEND;
+                l->token_text = sh_strdup((fdnum == 2) ? "2>>" : ">>");
+                return l->token_type;
+            }
+            /* N>| : clobber */
+            if (dir == '>' && p < l->len && l->input[p] == '|') {
+                p++;
+                l->pos = p;
+                l->token_fd = fdnum;
+                l->token_type = TOK_RREDIR2;
+                l->token_text = sh_strdup(">|");
+                return l->token_type;
+            }
+            /* plain N> / N< */
+            l->pos = p;
+            l->token_fd = fdnum;
+            if (dir == '>') {
+                l->token_type = (fdnum == 2) ? TOK_ERRREDIR : TOK_RREDIR;
+                l->token_text = sh_strdup((fdnum == 2) ? "2>" : ">");
+            } else {
+                l->token_type = TOK_LREDIR;
+                l->token_text = sh_strdup("<");
+            }
+            (void)fdlen;
+            return l->token_type;
+        }
+    }
+
     /* less-than: <, <<, <<-, <& */
     if (c == '<') {
+
         l->pos++;
         if (l->pos < l->len && l->input[l->pos] == '<') {
             l->pos++;
@@ -637,6 +897,13 @@ int lexer_next(Lexer *l) {
                     l->token_text = sh_strdup("2>>");
                     return TOK_ERRAPPEND;
                 }
+                if (l->pos < l->len && l->input[l->pos] == '&') {
+                    /* 2>& — duplicate a fd onto stderr (2>&1, 2>&-) */
+                    l->pos++;
+                    l->token_type = TOK_ERRDUP;
+                    l->token_text = sh_strdup("2>&");
+                    return TOK_ERRDUP;
+                }
                 l->token_type = TOK_ERRREDIR;
                 l->token_text = sh_strdup("2>");
                 return TOK_ERRREDIR;
@@ -670,6 +937,37 @@ int lexer_next(Lexer *l) {
         }
     }
 
+    /* brace group: `{ list; }`.
+     * A `{` is a reserved word only when it stands alone (followed by a
+     * blank or newline); `{a,b}` brace expansion and `${...}` are handled
+     * inside read_word / the $-branches above and never reach here. */
+    if (c == '{' && (l->pos + 1 >= l->len ||
+                     l->input[l->pos + 1] == ' ' ||
+                     l->input[l->pos + 1] == '\t' ||
+                     l->input[l->pos + 1] == '\n' ||
+                     l->input[l->pos + 1] == ';')) {
+        l->pos++;
+        l->token_type = TOK_LBRACE;
+        l->token_text = sh_strdup("{");
+        return TOK_LBRACE;
+    }
+    /* closing brace of a brace group: `}`, again only when standalone */
+    if (c == '}' && (l->pos + 1 >= l->len ||
+                     l->input[l->pos + 1] == ' ' ||
+                     l->input[l->pos + 1] == '\t' ||
+                     l->input[l->pos + 1] == '\n' ||
+                     l->input[l->pos + 1] == ';' ||
+                     l->input[l->pos + 1] == '&' ||
+                     l->input[l->pos + 1] == '|' ||
+                     l->input[l->pos + 1] == '>' ||
+                     l->input[l->pos + 1] == '<' ||
+                     l->input[l->pos + 1] == ')')) {
+        l->pos++;
+        l->token_type = TOK_RBRACE;
+        l->token_text = sh_strdup("}");
+        return TOK_RBRACE;
+    }
+
     /* parentheses */
     if (c == '(') {
         l->pos++;
@@ -697,8 +995,10 @@ int lexer_next(Lexer *l) {
         }
     }
 
-    /* word token — read_word handles quotes, backticks and $(...)
-     * internally, and merges adjacent quoted segments ("a"'b' → ab) */
+    /* word token — read_word handles quotes, backticks, $(...) and
+     * merges adjacent quoted segments ("a"'b' → ab).  A process
+     * substitution at the head of the word is read as an opaque word by
+     * the same routine (see lex_process_sub). */
     l->token_text = read_word(l);
     l->token_type = TOK_WORD;
     return TOK_WORD;

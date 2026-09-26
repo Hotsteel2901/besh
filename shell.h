@@ -32,6 +32,7 @@
  * ------------------------------------------------------------------- */
 #define MAX_ARGS        2048
 #define MAX_PATH        4096
+#define MAX_PSUB        128   /* pending process-substitution children */
 #define MAX_LINE        65536
 #define MAX_HISTORY     2000
 #define MAX_JOBS         512
@@ -62,9 +63,12 @@ typedef enum {
     TOK_RREDIR2,          /* >|  (force overwrite, noclobber)  */
     TOK_ERRREDIR,         /* 2>                                 */
     TOK_ERRAPPEND,        /* 2>>                                */
+    TOK_ERRDUP,           /* 2>&  (dup fd onto stderr)          */
     TOK_BOTHREDIR,        /* &>  or  >&  (stdout+stderr)       */
     TOK_LPAREN,           /* (                                  */
     TOK_RPAREN,           /* )                                  */
+    TOK_LBRACE,           /* {  (brace group)                   */
+    TOK_RBRACE,           /* }                                  */
     TOK_DLESS,            /* <<  (here-document)                */
     TOK_DLESSDASH,        /* <<- (here-doc strip leading tabs)  */
     TOK_NEWLINE,          /* logical newline                    */
@@ -82,6 +86,7 @@ typedef enum {
     NODE_OR,              /* left || right                      */
     NODE_BG,              /* child &                            */
     NODE_SUBSHELL,        /* ( child )                          */
+    NODE_BRACEGROUP,      /* { child; }  (same shell)           */
     NODE_NOT,             /* ! child                            */
     NODE_FUNCDEF,         /* name() { body; }                   */
     NODE_FOR,             /* for var in list; do body; done     */
@@ -105,6 +110,7 @@ typedef enum {
     REDIR_HEREDOC_DASH,   /* <<- DELIM                         */
     REDIR_DUPIN,          /* <&n   (dup fd n to stdin)         */
     REDIR_DUPOUT,         /* >&n   (dup fd n to stdout)        */
+    REDIR_CLOSE,          /* >&- / <&- (close the fd)          */
     REDIR_CLOBBER,        /* >|    (force overwrite)           */
 } RedirType;
 
@@ -307,6 +313,22 @@ typedef struct Shell {
     int          opt_autosuggest;/* fish: history autosuggestion  */
     int          opt_syntaxhighlight; /* fish: colored input      */
     int          opt_histignoredups;  /* skip duplicate history   */
+    int          opt_errexit;    /* set -e: exit on failed command */
+    int          opt_nounset;    /* set -u: error on unset variable */
+    int          opt_pipefail;   /* set -o pipefail: pipeline status */
+    int          in_condition;   /* >0 while evaluating if/while/until
+                                  * conditions and &&/|| operands, where
+                                  * errexit must stay suppressed */
+    int          exit_request;   /* set by `set -e`; REPL unwinds  */
+    int          last_exempt;    /* last executed node was exempt from
+                                  * errexit (&& / || / ! ) — lets an
+                                  * enclosing NODE_LIST stay quiet */
+
+    /* process substitution: pids of the children spawned for <(...) /
+     * >(...).  They are reaped like background jobs so they do not turn
+     * into zombies, and `wait` can be used to synchronise with them. */
+    int          psub_pids[MAX_PSUB];
+    int          npsub;
 
     /* line-editor state */
     char        *line_buf;
@@ -353,6 +375,8 @@ typedef struct {
     int         token_type;
     char       *token_text;
     int         token_quoted;    /* 1 if token came from quotes   */
+    int         token_fd;        /* fd number for `N>`/`N<` tokens,
+                                  * -1 when the token carried none  */
 } Lexer;
 
 Lexer *lexer_new(const char *input);
@@ -433,8 +457,14 @@ int  abbr_erase(const char *name);
  *  expand.c
  * ------------------------------------------------------------------- */
 char  *expand_string(const char *str);
+/* expand without word splitting / brace / pathname expansion —
+ * the result is exactly one word (used by [[ ]], case, assignments) */
+char  *expand_string_no_split(const char *str);
 char **expand_words(char **words, int *count);
 char **expand_words_q(char **words, int *quoted, int *count);
+/* fork the inner list of a `<(...)` / `>(...)` word and return a
+ * /dev/fd/N pathname; *pid receives the child pid */
+char *expand_process_sub(const char *word, int *pid);
 char  *unescape_word(const char *str);
 char  *unescape_token(const char *str);
 char  *tilde_expand(const char *str);

@@ -13,6 +13,7 @@
  * ================================================================ */
 
 #include "shell.h"
+#include <ctype.h>
 
 /* ---- forward declarations ------------------------------------ */
 static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
@@ -262,15 +263,95 @@ static int setup_redirections(Redir *redirs) {
 }
 
 /* ---- helper: detect NAME=value assignment word ---------------- */
-static int is_assignment(const char *word) {
-    if (!word || !(*word == '_' || (*word >= 'a' && *word <= 'z') ||
-                   (*word >= 'A' && *word <= 'Z')))
-        return 0;
+/* Recognise "name=", "name+=", "name[idx]=", "name[idx]+=".  Returns the
+ * length of the assignment prefix (up to and including '=' / '+='), or 0
+ * if `word` is not an assignment; *op is set to 1 for '+='. */
+static int assign_prefix_len(const char *word, int *op) {
+    if (op) *op = 0;
+    if (!word) return 0;
+    unsigned char c0 = (unsigned char)word[0];
+    if (!(c0 == '_' || isalpha(c0))) return 0;
     const char *p = word + 1;
-    while (*p && (*p == '_' || (*p >= 'a' && *p <= 'z') ||
-                  (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9')))
-        p++;
-    return *p == '=';
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) p++;
+    if (*p == '[') {
+        const char *cl = strchr(p, ']');
+        if (!cl) return 0;
+        p = cl + 1;
+    }
+    if (*p == '+') {
+        if (p[1] == '=') { if (op) *op = 1; return (int)(p - word) + 2; }
+        return 0;
+    }
+    if (*p == '=') return (int)(p - word) + 1;
+    return 0;
+}
+
+static int is_assignment(const char *word) {
+    return assign_prefix_len(word, NULL) > 0;
+}
+
+/* name[..]+?=( ... ) — a whole array literal kept as one lexer token */
+static int is_array_literal(const char *word) {
+    int op;
+    int n = assign_prefix_len(word, &op);
+    if (n <= 0) return 0;
+    if (word[n] != '(') return 0;
+    size_t l = strlen(word);
+    return l > (size_t)n + 1 && word[l - 1] == ')';
+}
+
+/* evaluate `a=(one two three)` / `a+=(four)` */
+static void exec_array_literal(const char *word, int export_flag) {
+    (void)export_flag;
+    int op;
+    int n = assign_prefix_len(word, &op);       /* index of '(' */
+    char *namepart = sh_strndup(word, n - 1 - (op ? 1 : 0));
+    char *inner = sh_strndup(word + n + 1, strlen(word) - n - 2);
+
+    /* lex the element list (preserving per-element quoting) */
+    Lexer *lx = lexer_new(inner);
+    char *toks[MAX_ARGS];
+    int qt[MAX_ARGS];
+    int nt = 0;
+    int t;
+    while ((t = lexer_next(lx)) == TOK_WORD && nt < MAX_ARGS - 1) {
+        toks[nt] = sh_strdup(lx->token_text);
+        qt[nt] = lx->token_quoted;
+        nt++;
+    }
+    lexer_free(lx);
+
+    int nw = nt;
+    char **ex = expand_words_q(toks, qt, &nw);
+    for (int i = 0; i < nt; i++) free(toks[i]);
+
+    char *base = NULL;
+    long idx = 0;
+    int star = 0;
+    int kind = var_parse_subscript(namepart, &base, &idx, &star);
+    if (!base) base = sh_strdup(namepart);
+
+    if (kind == 1) {
+        for (int i = 0; i < nw; i++) var_array_set(base, idx + i, ex[i]);
+    } else {
+        long start = 0;
+        if (op) {
+            int ni = 0;
+            long *idxs = var_array_indices(base, &ni);
+            if (ni > 0) start = idxs[ni - 1] + 1;
+            free(idxs);
+        } else {
+            var_array_clear(base);
+        }
+        for (int i = 0; i < nw; i++) var_array_set(base, start + i, ex[i]);
+    }
+    var_set_array_attr(base, 1);
+
+    for (int i = 0; i < nw; i++) free(ex[i]);
+    free(ex);
+    free(base);
+    free(inner);
+    free(namepart);
 }
 
 /* ---- execute a single simple command ------------------------- */
@@ -278,18 +359,29 @@ int execute_command(ASTNode *node) {
     if (!node || node->type != NODE_COMMAND) return 1;
     if (node->argc == 0) return 0;
 
+    Shell *sh = shell_get();
+
+    /* a lone array literal is a complete assignment */
+    if (node->argc == 1 && is_array_literal(node->argv[0])) {
+        exec_array_literal(node->argv[0], sh->opt_allexport);
+        sh->exit_status = 0;
+        return 0;
+    }
+
     /* ---- expand variables, braces and globs in all arguments ---- */
     int expanded_argc = node->argc;
     char **words = sh_malloc((node->argc + 1) * sizeof(char *));
-    for (int i = 0; i < node->argc; i++)
+    int *qwords = sh_malloc((node->argc + 1) * sizeof(int));
+    for (int i = 0; i < node->argc; i++) {
         words[i] = sh_strdup(node->argv[i]);
+        qwords[i] = node->argv_quoted ? node->argv_quoted[i] : 0;
+    }
     words[node->argc] = NULL;
 
-    char **expanded_argv = expand_words(words, &expanded_argc);
+    char **expanded_argv = expand_words_q(words, qwords, &expanded_argc);
     for (int i = 0; i < node->argc; i++) free(words[i]);
     free(words);
-
-    Shell *sh = shell_get();
+    free(qwords);
 
     /* ---- detect leading variable assignments (NAME=value ...) ---- */
     int n_assign = 0;
@@ -302,10 +394,11 @@ int execute_command(ASTNode *node) {
         /* all words are assignments — set shell variables */
         int ret = 0;
         for (int i = 0; i < n_assign; i++) {
-            char *eq = strchr(expanded_argv[i], '=');
-            *eq = '\0';
-            sh_setenv(expanded_argv[i], eq + 1, sh->opt_allexport);
-            *eq = '=';
+            int op;
+            int n = assign_prefix_len(expanded_argv[i], &op);
+            char *nm = sh_strndup(expanded_argv[i], n - 1 - (op ? 1 : 0));
+            sh_assign(nm, expanded_argv[i] + n, sh->opt_allexport, op);
+            free(nm);
         }
         sh->exit_status = ret;
         for (int j = 0; j < expanded_argc; j++) free(expanded_argv[j]);
@@ -345,8 +438,15 @@ int execute_command(ASTNode *node) {
             }
             sh->npositional = fnargs;
 
+            /* push a function-call scope for `local` variables */
+            scope_push();
+
             int ret = execute_node_internal(sh->funcs[i].body,
                                             NULL, NULL, 0);
+
+            /* discard locals and restore the caller's variables */
+            scope_pop();
+            sh->return_request = 0;
 
             /* free function positional parameters
              * (shift may have consumed some of them) */
@@ -585,12 +685,16 @@ int execute_pipeline(ASTNode *pipeline) {
                 /* expand variables / globs in the pipeline child */
                 int wc = cmds[i]->argc;
                 char **w = sh_malloc((cmds[i]->argc + 1) * sizeof(char *));
-                for (int a = 0; a < cmds[i]->argc; a++)
+                int *wq = sh_malloc((cmds[i]->argc + 1) * sizeof(int));
+                for (int a = 0; a < cmds[i]->argc; a++) {
                     w[a] = sh_strdup(cmds[i]->argv[a]);
+                    wq[a] = cmds[i]->argv_quoted ? cmds[i]->argv_quoted[a] : 0;
+                }
                 w[cmds[i]->argc] = NULL;
-                char **ex = expand_words(w, &wc);
+                char **ex = expand_words_q(w, wq, &wc);
                 for (int a = 0; a < cmds[i]->argc; a++) free(w[a]);
                 free(w);
+                free(wq);
 
                 builtin_fn bf = builtin_lookup(ex[0]);
                 if (bf) {
@@ -651,6 +755,9 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
     Shell *sh = shell_get();
     if (!node) return 0;
 
+    /* `return` unwinds the current function body / sourced file */
+    if (sh->return_request) return sh->exit_status;
+
     int ret = 0;
 
     switch (node->type) {
@@ -669,12 +776,14 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
 
     case NODE_LIST:
         execute_node_internal(node->left, NULL, NULL, async);
-        if (sh->break_request || sh->continue_request) break;
+        if (sh->break_request || sh->continue_request || sh->return_request)
+            break;
         ret = execute_node_internal(node->right, NULL, NULL, async);
         break;
 
     case NODE_AND:
         ret = execute_node_internal(node->left, NULL, NULL, async);
+        if (sh->return_request) break;
         if (ret == 0) {
             ret = execute_node_internal(node->right, NULL, NULL, async);
         }
@@ -682,6 +791,7 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
 
     case NODE_OR:
         ret = execute_node_internal(node->left, NULL, NULL, async);
+        if (sh->return_request) break;
         if (ret != 0) {
             ret = execute_node_internal(node->right, NULL, NULL, async);
         }
@@ -768,20 +878,47 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
 
     case NODE_FOR: {
         char *var_name = node->func_name;  /* variable name stored here */
+        char **items = NULL;
+        int nitems = 0;
+
         if (node->cond && node->cond->type == NODE_COMMAND) {
-            for (int i = 0; i < node->cond->argc; i++) {
-                sh_setenv(var_name, node->cond->argv[i], 0);
-                ret = execute_node_internal(node->body, NULL, NULL, 0);
-                if (sh->break_request) {
-                    sh->break_request = 0;
-                    break;
-                }
-                if (sh->continue_request) {
-                    sh->continue_request = 0;
-                    continue;
-                }
+            /* expand the word list: honours $list, "${a[@]}", "$@", globs */
+            int wc = node->cond->argc;
+            char **w = sh_malloc((wc + 1) * sizeof(char *));
+            int *wq = sh_malloc((wc + 1) * sizeof(int));
+            for (int i = 0; i < wc; i++) {
+                w[i] = sh_strdup(node->cond->argv[i]);
+                wq[i] = node->cond->argv_quoted ? node->cond->argv_quoted[i] : 0;
+            }
+            w[wc] = NULL;
+            items = expand_words_q(w, wq, &wc);
+            nitems = wc;
+            for (int i = 0; i < node->cond->argc; i++) free(w[i]);
+            free(w);
+            free(wq);
+        } else {
+            /* no `in` list: iterate over the positional parameters */
+            nitems = sh->npositional;
+            items = sh_malloc((nitems ? nitems : 1) * sizeof(char *));
+            for (int i = 0; i < nitems; i++)
+                items[i] = sh_strdup(sh->positional[i]);
+        }
+
+        for (int i = 0; i < nitems; i++) {
+            sh_setenv(var_name, items[i], 0);
+            ret = execute_node_internal(node->body, NULL, NULL, 0);
+            if (sh->return_request) break;
+            if (sh->break_request) {
+                sh->break_request = 0;
+                break;
+            }
+            if (sh->continue_request) {
+                sh->continue_request = 0;
+                continue;
             }
         }
+        for (int i = 0; i < nitems; i++) free(items[i]);
+        free(items);
         break;
     }
 
@@ -789,9 +926,11 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
         int is_until = (node->argc == 1);
         while (1) {
             int cond_ret = execute_node_internal(node->cond, NULL, NULL, 0);
+            if (sh->return_request) break;
             if (is_until) { if (cond_ret == 0) break; }
             else          { if (cond_ret != 0) break; }
             ret = execute_node_internal(node->body, NULL, NULL, 0);
+            if (sh->return_request) break;
             if (sh->break_request) {
                 sh->break_request = 0;
                 break;

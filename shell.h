@@ -126,6 +126,7 @@ typedef struct ASTNode {
 
     /* NODE_COMMAND */
     char         **argv;
+    int           *argv_quoted;   /* parallel to argv: 1 if word was quoted */
     int            argc;
     int            argv_cap;
     Redir         *redirs;
@@ -188,7 +189,32 @@ typedef struct Var {
     char *value;
     int   exported;     /* 1 = in environment for children */
     int   readonly;
+    int   array;        /* 1 = variable has the array attribute */
+    int   is_element;   /* 1 = name is of the form base[index]  */
+    long  index;        /* element index when is_element        */
 } Var;
+
+/* Snapshot of one variable entry saved by a function-local scope */
+typedef struct SavedVar {
+    char *name;
+    char *value;        /* NULL if the variable did not exist   */
+    int   existed;
+    int   exported;
+    int   readonly;
+    int   array;
+    int   is_element;
+    long  index;
+} SavedVar;
+
+/* A function-call frame: saved variables restored on return */
+typedef struct ScopeFrame {
+    SavedVar *saved;
+    int       nsaved;
+    int       saved_cap;
+    char    **locals;   /* base names already declared local    */
+    int       nlocals;
+    int       locals_cap;
+} ScopeFrame;
 
 /* -------------------------------------------------------------------
  *  Shell function
@@ -289,6 +315,8 @@ typedef struct Shell {
     int          line_pos;       /* cursor position in buffer     */
     char        *hist_search;    /* prefix for up-arrow search     */
     char        *suggestion;     /* autosuggestion suffix (0=none) */
+    int          line_interrupted; /* Ctrl-C aborted the current line */
+    int          term_in_raw;    /* 1 while the tty is in raw mode */
 
     /* positional parameters ($1, $2, ...) */
     char       **positional;
@@ -297,6 +325,14 @@ typedef struct Shell {
     /* loop control: break/continue signaling */
     int          break_request;     /* 1 = break innermost loop */
     int          continue_request;  /* 1 = continue innermost loop */
+
+    /* return signaling (function body / sourced file) */
+    int          return_request;    /* 1 = unwind current function */
+
+    /* function-call scope stack (local variables) */
+    ScopeFrame  *scopes;
+    int          nscopes;
+    int          scopes_cap;
 } Shell;
 
 /* -------------------------------------------------------------------
@@ -377,6 +413,9 @@ int  builtin_dirs(int argc, char **argv);
 int  builtin_setopt(int argc, char **argv);
 int  builtin_unsetopt(int argc, char **argv);
 int  builtin_readonly(int argc, char **argv);
+int  builtin_declare(int argc, char **argv);
+int  builtin_local(int argc, char **argv);
+int  builtin_typeset(int argc, char **argv);
 
 typedef int (*builtin_fn)(int, char **);
 builtin_fn builtin_lookup(const char *name);
@@ -395,6 +434,7 @@ int  abbr_erase(const char *name);
  * ------------------------------------------------------------------- */
 char  *expand_string(const char *str);
 char **expand_words(char **words, int *count);
+char **expand_words_q(char **words, int *quoted, int *count);
 char  *unescape_word(const char *str);
 char  *unescape_token(const char *str);
 char  *tilde_expand(const char *str);
@@ -433,15 +473,57 @@ char  *sh_strdup(const char *s);
 void  *sh_malloc(size_t n);
 void  *sh_realloc(void *p, size_t n);
 char  *sh_strndup(const char *s, size_t n);
+/* sh_trim() trims leading/trailing blanks IN PLACE and returns a pointer
+ * to the first non-blank character — i.e. an INTERNAL pointer into `s`
+ * (or `s + k`).  The result must NEVER be passed to free(); free the
+ * original buffer instead. */
 char  *sh_trim(char *s);
 int    sh_is_whitespace(int c);
 int    sh_is_special_char(int c);
 char  *sh_getenv(const char *name);
 void   sh_setenv(const char *name, const char *value, int export);
 void   sh_unsetenv(const char *name);
+/* ---- array variables (indexed) -------------------------------- */
+/* The base name and its elements are separate Var entries: element k of
+ * `a` is stored under the literal name `a[k]`, while a scalar mirror `a`
+ * always holds element 0 (so `$a` == `${a[0]}`). */
+int    var_base_len(const char *name);          /* len up to '[' or all */
+char  *var_base_of(const char *name);            /* malloc'd base name  */
+int    var_parse_subscript(const char *name, char **base_out, long *idx,
+                           int *star);            /* name / name[i] / name[@] */
+int    var_is_array(const char *base);
+void   var_set_array_attr(const char *base, int on);
+void   var_array_set(const char *base, long idx, const char *value);
+char  *var_array_get(const char *base, long idx, int *is_set);
+int    var_array_unset(const char *base, long idx);
+void   var_array_clear(const char *base);        /* elements + scalar   */
+char **var_array_values(const char *base, int *n);
+long  *var_array_indices(const char *base, int *n);
+int    var_array_count(const char *base);
+void   var_free_list(char **v, int n);
+/* assign to a name that may carry an array subscript (no word splitting) */
+void   sh_assign(const char *name, const char *value, int export_flag,
+                 int append);
+/* ---- function-local scopes ------------------------------------ */
+void   scope_push(void);
+void   scope_pop(void);
+void   scope_declare(const char *name);          /* save current value  */
+int    scope_in_function(void);
 char  *resolve_path(const char *cmd);
 void   history_save(void);
 void   history_load(void);
+
+/* Returns 0 when `input` is a complete command, otherwise a positive
+ * value telling the caller how to join the next physical line:
+ *   1 = join with '\n'          (trailing \ | && || do then { ( …)
+ *   2 = join with NO separator  (unterminated quote — see note in main.c)
+ * Used by the interactive REPL (multi-line editing) and by `source`. */
+int    sh_input_incomplete(const char *input);
+/* Read a whole script/stream from `f` and execute it, accumulating
+ * physical lines until each logical command is complete (so multi-line
+ * if/for/while and function definitions work).  Used by the script-file
+ * entry point, `source` and ~/.beshrc.  Returns the last status. */
+int    sh_run_stream(FILE *f);
 
 /* --- history helpers (implemented in main.c) --- */
 void history_add(const char *line);      /* add (respect dups/HISTSIZE)  */

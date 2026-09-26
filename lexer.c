@@ -129,6 +129,86 @@ static void lex_copy_dollar_paren(Lexer *l, char **buf, int *blen, int *bcap) {
     l->pos = i;
 }
 
+/* Copy a whole `${ ... }` parameter expansion verbatim and advance past it.
+ * This keeps the whole expansion as one word unit: characters that would
+ * otherwise terminate a word (space, &, ;, |, (, ), /, #, %) are allowed
+ * inside the braces.  Brace pairing honours nested `${ }`, backslash
+ * escapes and quotes. */
+static void lex_copy_dollar_brace(Lexer *l, char **buf, int *blen, int *bcap) {
+    int start = l->pos;
+    int i = l->pos + 2;              /* skip '${' */
+    int depth = 1;
+    while (i < l->len && depth > 0) {
+        char d = l->input[i];
+        if (d == '\\' && i + 1 < l->len) { i += 2; continue; }
+        if (d == '\'') {
+            i++;
+            while (i < l->len && l->input[i] != '\'') i++;
+            if (i < l->len) i++;
+            continue;
+        }
+        if (d == '"') {
+            i++;
+            while (i < l->len && l->input[i] != '"') {
+                if (l->input[i] == '\\' && i + 1 < l->len) i++;
+                i++;
+            }
+            if (i < l->len) i++;
+            continue;
+        }
+        if (d == '$' && i + 1 < l->len && l->input[i + 1] == '{') { depth++; i += 2; continue; }
+        if (d == '}') { depth--; if (depth == 0) { i++; break; } }
+        i++;
+    }
+    for (int k = start; k < i; k++)
+        lex_append_raw(buf, blen, bcap, (unsigned char)l->input[k]);
+    l->pos = i;
+}
+
+/* Detect an array-assignment literal `name[...]+?=(...)` starting at the
+ * current position.  Returns the end offset (just past the closing paren)
+ * or -1 if this is not an array literal. */
+static int lex_array_literal_end(Lexer *l) {
+    int i = l->pos;
+    if (i >= l->len || !lex_name_start((unsigned char)l->input[i])) return -1;
+    i++;
+    while (i < l->len && lex_name_char((unsigned char)l->input[i])) i++;
+    if (i < l->len && l->input[i] == '[') {
+        int j = i + 1;
+        while (j < l->len && l->input[j] != ']' && l->input[j] != '\n') j++;
+        if (j >= l->len || l->input[j] != ']') return -1;
+        i = j + 1;
+    }
+    if (i < l->len && l->input[i] == '+') i++;
+    if (i >= l->len || l->input[i] != '=') return -1;
+    i++;
+    if (i >= l->len || l->input[i] != '(') return -1;
+    int depth = 0, j = i;
+    while (j < l->len) {
+        char d = l->input[j];
+        if (d == '\\' && j + 1 < l->len) { j += 2; continue; }
+        if (d == '\'') {
+            j++;
+            while (j < l->len && l->input[j] != '\'') j++;
+            if (j < l->len) j++;
+            continue;
+        }
+        if (d == '"') {
+            j++;
+            while (j < l->len && l->input[j] != '"') {
+                if (l->input[j] == '\\' && j + 1 < l->len) j++;
+                j++;
+            }
+            if (j < l->len) j++;
+            continue;
+        }
+        if (d == '(') depth++;
+        else if (d == ')') { depth--; if (depth == 0) return j + 1; }
+        j++;
+    }
+    return -1;
+}
+
 /* read a single-quoted string: '...'
  * Every character is literal, so each special character is backslash-
  * protected in the returned text (quote semantics survive until expansion). */
@@ -163,6 +243,36 @@ static char *read_double_quoted(Lexer *l) {
     while (l->pos < l->len) {
         char c = l->input[l->pos];
         if (c == '"') { l->pos++; closed = 1; break; }
+        /* Inside ${ ... }: copy raw so that subscripts ([@], [*]), slashes,
+         * '&', '#', '%', spaces and escapes survive verbatim until the
+         * parameter-expansion stage. */
+        if (var_depth > 0) {
+            if (c == '\\' && l->pos + 1 < l->len) {
+                lex_append_raw(&buf, &blen, &bcap, '\\');
+                lex_append_raw(&buf, &blen, &bcap,
+                               (unsigned char)l->input[l->pos + 1]);
+                if (l->input[l->pos + 1] == '\n') l->lineno++;
+                l->pos += 2;
+                continue;
+            }
+            if (c == '$' && l->pos + 1 < l->len && l->input[l->pos + 1] == '{') {
+                lex_append_raw(&buf, &blen, &bcap, '$');
+                lex_append_raw(&buf, &blen, &bcap, '{');
+                var_depth++;
+                l->pos += 2;
+                continue;
+            }
+            if (c == '}') {
+                lex_append_raw(&buf, &blen, &bcap, '}');
+                var_depth--;
+                l->pos++;
+                continue;
+            }
+            if (c == '\n') l->lineno++;
+            lex_append_raw(&buf, &blen, &bcap, (unsigned char)c);
+            l->pos++;
+            continue;
+        }
         if (c == '\\') {
             l->pos++;
             prev_dollar = 0;
@@ -275,6 +385,14 @@ static char *read_word(Lexer *l) {
             while (blen + sublen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
             memcpy(buf + blen, l->input + start, sublen);
             blen += sublen;
+            continue;
+        }
+
+        /* handle ${...} before the special-char check: the whole parameter
+         * expansion must stay one word even if it contains spaces, &, ;,
+         * |, (, ), /, #, % ... */
+        if (c == '$' && l->pos + 1 < l->len && l->input[l->pos + 1] == '{') {
+            lex_copy_dollar_brace(l, &buf, &blen, &bcap);
             continue;
         }
 
@@ -564,6 +682,19 @@ int lexer_next(Lexer *l) {
         l->token_type = TOK_RPAREN;
         l->token_text = sh_strdup(")");
         return TOK_RPAREN;
+    }
+
+    /* array-assignment literal: name[...]+?=( ... ) — keep it as one unit
+     * so the parser/executor can see the whole `( ... )` element list. */
+    {
+        int ae = lex_array_literal_end(l);
+        if (ae > l->pos) {
+            l->token_text = sh_strndup(l->input + l->pos, ae - l->pos);
+            l->pos = ae;
+            l->token_type = TOK_WORD;
+            l->token_quoted = 1;
+            return TOK_WORD;
+        }
     }
 
     /* word token — read_word handles quotes, backticks and $(...)

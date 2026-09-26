@@ -7,6 +7,7 @@
  * ================================================================ */
 
 #include "shell.h"
+#include <ctype.h>
 
 /* ================================================================
  *  cd [dir]  — change working directory
@@ -165,13 +166,16 @@ int builtin_echo(int argc, char **argv) {
 }
 
 /* ================================================================
- *  export [name[=value]]...   — set environment variables
- *  export -p                  — print all exported variables
+ *  export [-p] [-n] [name[=value]]...  — set/clear environment vars
+ *  export          — list exported variables
+ *  export -p       — bash-style declaration list
+ *  export -n NAME  — keep NAME but remove its exported attribute
  * ================================================================ */
 int builtin_export(int argc, char **argv) {
+    Shell *sh = shell_get();
+
     if (argc == 1) {
         /* print all exported variables */
-        Shell *sh = shell_get();
         for (int i = 0; i < sh->nvars; i++) {
             if (sh->vars[i].exported) {
                 printf("declare -x %s", sh->vars[i].name);
@@ -183,38 +187,57 @@ int builtin_export(int argc, char **argv) {
         return 0;
     }
 
-    if (argc == 2 && strcmp(argv[1], "-p") == 0) {
-        Shell *sh = shell_get();
-        for (int i = 0; i < sh->nvars; i++) {
-            if (sh->vars[i].exported)
-                printf("export %s=\"%s\"\n", sh->vars[i].name,
-                       sh->vars[i].value ? sh->vars[i].value : "");
+    int unexport = 0;
+    int i = 1;
+    for (; i < argc; i++) {
+        if (strcmp(argv[i], "-p") == 0) {
+            for (int j = 0; j < sh->nvars; j++) {
+                if (sh->vars[j].exported)
+                    printf("export %s=\"%s\"\n", sh->vars[j].name,
+                           sh->vars[j].value ? sh->vars[j].value : "");
+            }
+            return 0;
         }
-        return 0;
+        if (strcmp(argv[i], "-n") == 0) { unexport = 1; continue; }
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
+        if (argv[i][0] == '-' && argv[i][1]) continue;  /* ignore other flags */
+        break;
     }
 
-    for (int i = 1; i < argc; i++) {
+    for (; i < argc; i++) {
         char *eq = strchr(argv[i], '=');
         if (eq) {
             char *name = sh_strndup(argv[i], eq - argv[i]);
             char *val = sh_strdup(eq + 1);
-            sh_setenv(name, val, 1);
+            if (unexport) {
+                sh_setenv(name, val, 0);   /* value only, no export */
+                for (int j = 0; j < sh->nvars; j++)
+                    if (strcmp(sh->vars[j].name, name) == 0)
+                        sh->vars[j].exported = 0;
+                unsetenv(name);
+            } else {
+                sh_setenv(name, val, 1);
+            }
             free(name);
             free(val);
         } else {
-            /* mark existing var as exported */
-            Shell *sh = shell_get();
+            /* mark existing var as exported (or clear with -n) */
             int found = 0;
             for (int j = 0; j < sh->nvars; j++) {
                 if (strcmp(sh->vars[j].name, argv[i]) == 0) {
-                    sh->vars[j].exported = 1;
-                    if (sh->vars[j].value)
-                        setenv(argv[i], sh->vars[j].value, 1);
+                    if (unexport) {
+                        sh->vars[j].exported = 0;
+                        unsetenv(argv[i]);
+                    } else {
+                        sh->vars[j].exported = 1;
+                        if (sh->vars[j].value)
+                            setenv(argv[i], sh->vars[j].value, 1);
+                    }
                     found = 1;
                     break;
                 }
             }
-            if (!found) {
+            if (!found && !unexport) {
                 /* create empty exported var */
                 sh_setenv(argv[i], "", 1);
             }
@@ -225,6 +248,8 @@ int builtin_export(int argc, char **argv) {
 
 /* ================================================================
  *  unset [-f] [-v] name...
+ *  Array-aware: `unset a`, `unset 'a[@]'` (whole array) and
+ *  `unset 'a[1]'` (single element) are all supported.
  * ================================================================ */
 int builtin_unset(int argc, char **argv) {
     int func_mode = 0;
@@ -254,8 +279,21 @@ int builtin_unset(int argc, char **argv) {
             }
         }
 
-        if (var_mode)
-            sh_unsetenv(argv[i]);
+        if (var_mode) {
+            char *base = NULL;
+            long idx = 0;
+            int star = 0;
+            int kind = var_parse_subscript(argv[i], &base, &idx, &star);
+            if (kind == 2) {
+                if (base) var_array_clear(base);
+            } else if (kind == 1) {
+                if (base) var_array_unset(base, idx);
+            } else {
+                if (base && var_is_array(base)) var_array_clear(base);
+                else sh_unsetenv(argv[i]);
+            }
+            free(base);
+        }
     }
     return 0;
 }
@@ -611,41 +649,304 @@ int builtin_unsetopt(int argc, char **argv) {
 }
 
 /* ================================================================
- *  readonly [name[=value]]...  — mark variables read-only
+ *  Variable declarations: readonly / declare / typeset / local
+ * ================================================================ */
+
+/* Split "name", "name=value", "name+=value", "name[idx]=value" or
+ * "name=( ... )".  Returns 1 for an assignment form, 0 for a bare name. */
+static int bi_assign_split(const char *word, char **name, char **value,
+                           int *op, int *is_lit, char **inner) {
+    *name = NULL; *value = NULL; *inner = NULL; *op = 0; *is_lit = 0;
+    if (!word) return 0;
+    unsigned char c0 = (unsigned char)word[0];
+    if (!(c0 == '_' || isalpha(c0))) return 0;
+    const char *p = word + 1;
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) p++;
+    if (*p == '[') {
+        const char *cl = strchr(p, ']');
+        if (!cl) return 0;
+        p = cl + 1;
+    }
+    int o = 0;
+    if (*p == '+') { if (p[1] != '=') return 0; o = 1; p++; }
+    else if (*p != '=') return 0;
+
+    *name = sh_strndup(word, p - word);
+    p++;                              /* past '=' */
+    if (*p == '(') {
+        size_t l = strlen(word);
+        if (l > (size_t)(p - word) + 1 && word[l - 1] == ')') {
+            *is_lit = 1;
+            *inner = sh_strndup(p + 1, l - (p - word) - 2);
+        }
+    } else {
+        *value = sh_strdup(p);
+    }
+    *op = o;
+    return 1;
+}
+
+/* find the base (non-element) Var entry for `name` */
+static Var *bi_find_base(const char *name) {
+    Shell *sh = shell_get();
+    char *base = var_base_of(name);
+    Var *res = NULL;
+    for (int i = 0; i < sh->nvars; i++)
+        if (!sh->vars[i].is_element && strcmp(sh->vars[i].name, base) == 0) {
+            res = &sh->vars[i];
+            break;
+        }
+    free(base);
+    return res;
+}
+
+/* apply -a/-r/-x attributes to the base variable, creating it if needed */
+static void bi_apply_attrs(const char *name, int a, int r, int x) {
+    Shell *sh = shell_get();
+    char *base = var_base_of(name);
+    if (a) var_set_array_attr(base, 1);
+    Var *v = NULL;
+    for (int i = 0; i < sh->nvars; i++)
+        if (!sh->vars[i].is_element && strcmp(sh->vars[i].name, base) == 0) {
+            v = &sh->vars[i];
+            break;
+        }
+    if (!v && (r || x)) {
+        sh_setenv(base, "", 0);
+        for (int i = 0; i < sh->nvars; i++)
+            if (!sh->vars[i].is_element && strcmp(sh->vars[i].name, base) == 0) {
+                v = &sh->vars[i];
+                break;
+            }
+    }
+    if (v) {
+        if (x) { v->exported = 1; setenv(base, v->value ? v->value : "", 1); }
+        if (r) v->readonly = 1;
+    }
+    free(base);
+}
+
+/* print one variable bash-style (`declare -a a=(...)` etc.) */
+static int bi_print_var(const char *name) {
+    Shell *sh = shell_get();
+    Var *base = bi_find_base(name);
+    int isarr = var_is_array(name);
+    if (!base && !isarr) return 0;
+
+    char flags[8];
+    int f = 0;
+    flags[f++] = '-';
+    if (isarr) flags[f++] = 'a';
+    if (base && base->readonly) flags[f++] = 'r';
+    if (base && base->exported) flags[f++] = 'x';
+    if (f == 1) flags[f++] = '-';
+    flags[f] = '\0';
+
+    if (isarr) {
+        int ni = 0;
+        long *idxs = var_array_indices(name, &ni);
+        if (ni == 0) {
+            printf("declare %s %s\n", flags, name);
+        } else {
+            printf("declare %s %s=(", flags, name);
+            for (int i = 0; i < ni; i++) {
+                char *v = var_array_get(name, idxs[i], NULL);
+                if (i) printf(" ");
+                printf("[%ld]=\"%s\"", idxs[i], v);
+                free(v);
+            }
+            printf(")\n");
+        }
+        free(idxs);
+    } else {
+        printf("declare %s %s=\"%s\"\n", flags, name,
+               base->value ? base->value : "");
+    }
+    (void)sh;
+    return 1;
+}
+
+/* shared implementation for declare / typeset / local */
+static int declare_impl(int argc, char **argv, int is_local) {
+    Shell *sh = shell_get();
+    if (is_local && sh->nscopes == 0) {
+        fprintf(stderr, "besh: local: can only be used in a function\n");
+        return 1;
+    }
+
+    int opt_a = 0, opt_r = 0, opt_x = 0, opt_p = 0;
+    int i = 1;
+    for (; i < argc; i++) {
+        if (argv[i][0] != '-' || !argv[i][1]) break;
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
+        for (char *p = argv[i] + 1; *p; p++) {
+            switch (*p) {
+            case 'a': opt_a = 1; break;
+            case 'r': opt_r = 1; break;
+            case 'x': opt_x = 1; break;
+            case 'p': opt_p = 1; break;
+            case 'i': break;              /* accepted (integer attr) */
+            case 'g': break;              /* accepted */
+            default:
+                fprintf(stderr, "besh: %s: -%c: invalid option\n",
+                        is_local ? "local" : "declare", *p);
+                return 1;
+            }
+        }
+    }
+
+    /* declare -p / declare (no names) — print variables */
+    if (opt_p || i >= argc) {
+        if (i >= argc) {
+            for (int k = 0; k < sh->nvars; k++) {
+                if (sh->vars[k].is_element) continue;
+                bi_print_var(sh->vars[k].name);
+            }
+            return 0;
+        }
+        int rc = 0;
+        for (; i < argc; i++) {
+            if (!bi_print_var(argv[i])) {
+                fprintf(stderr, "besh: declare: %s: not found\n", argv[i]);
+                rc = 1;
+            }
+        }
+        return rc;
+    }
+
+    int rc = 0;
+    for (; i < argc; i++) {
+        char *name = NULL, *value = NULL, *inner = NULL;
+        int op = 0, is_lit = 0;
+        if (bi_assign_split(argv[i], &name, &value, &op, &is_lit, &inner)) {
+            if (is_local) scope_declare(name);
+            if (opt_a) var_set_array_attr(name, 1);
+            if (is_lit) {
+                Lexer *lx = lexer_new(inner);
+                char *toks[MAX_ARGS];
+                int qt[MAX_ARGS];
+                int nt = 0, t;
+                while ((t = lexer_next(lx)) == TOK_WORD && nt < MAX_ARGS - 1) {
+                    toks[nt] = sh_strdup(lx->token_text);
+                    qt[nt] = lx->token_quoted;
+                    nt++;
+                }
+                lexer_free(lx);
+                int nw = nt;
+                char **ex = expand_words_q(toks, qt, &nw);
+                for (int k = 0; k < nt; k++) free(toks[k]);
+                char *base = NULL;
+                long idx = 0;
+                int star = 0;
+                int kind = var_parse_subscript(name, &base, &idx, &star);
+                if (!base) base = sh_strdup(name);
+                if (kind != 1) {
+                    long start = 0;
+                    if (op) {
+                        int ni = 0;
+                        long *idxs = var_array_indices(base, &ni);
+                        if (ni > 0) start = idxs[ni - 1] + 1;
+                        free(idxs);
+                    } else {
+                        var_array_clear(base);
+                    }
+                    for (int k = 0; k < nw; k++)
+                        var_array_set(base, start + k, ex[k]);
+                } else {
+                    for (int k = 0; k < nw; k++)
+                        var_array_set(base, idx + k, ex[k]);
+                }
+                var_set_array_attr(base, 1);
+                for (int k = 0; k < nw; k++) free(ex[k]);
+                free(ex);
+                free(base);
+            } else {
+                sh_assign(name, value ? value : "", opt_x, op);
+            }
+            bi_apply_attrs(name, opt_a, opt_r, opt_x);
+            free(name); free(value); free(inner);
+        } else {
+            if (is_local) scope_declare(argv[i]);
+            bi_apply_attrs(argv[i], opt_a, opt_r, opt_x);
+        }
+    }
+    return rc;
+}
+
+int builtin_declare(int argc, char **argv) { return declare_impl(argc, argv, 0); }
+int builtin_typeset(int argc, char **argv) { return declare_impl(argc, argv, 0); }
+int builtin_local(int argc, char **argv)   { return declare_impl(argc, argv, 1); }
+
+/* ================================================================
+ *  readonly [-a] [-p] [name[=value]]...  — mark variables read-only
  * ================================================================ */
 int builtin_readonly(int argc, char **argv) {
     Shell *sh = shell_get();
 
-    if (argc == 1) {
-        for (int i = 0; i < sh->nvars; i++)
-            if (sh->vars[i].readonly)
-                printf("readonly %s=\"%s\"\n", sh->vars[i].name,
-                       sh->vars[i].value ? sh->vars[i].value : "");
+    int opt_a = 0, opt_p = 0, i = 1;
+    for (; i < argc; i++) {
+        if (argv[i][0] != '-' || !argv[i][1]) break;
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
+        for (char *p = argv[i] + 1; *p; p++) {
+            if (*p == 'a') opt_a = 1;
+            else if (*p == 'p') opt_p = 1;
+        }
+    }
+
+    if (opt_p || i >= argc) {
+        for (int k = 0; k < sh->nvars; k++) {
+            if (sh->vars[k].is_element) continue;
+            if (sh->vars[k].readonly) bi_print_var(sh->vars[k].name);
+        }
         return 0;
     }
 
-    for (int i = 1; i < argc; i++) {
-        char *eq = strchr(argv[i], '=');
-        if (eq) {
-            char *name = sh_strndup(argv[i], eq - argv[i]);
-            char *val  = sh_strdup(eq + 1);
-            sh_setenv(name, val, 0);
-            free(val);
-            for (int j = 0; j < sh->nvars; j++)
-                if (strcmp(sh->vars[j].name, name) == 0)
-                    sh->vars[j].readonly = 1;
-            free(name);
+    for (; i < argc; i++) {
+        char *name = NULL, *value = NULL, *inner = NULL;
+        int op = 0, is_lit = 0;
+        if (bi_assign_split(argv[i], &name, &value, &op, &is_lit, &inner)) {
+            if (is_lit) {
+                Lexer *lx = lexer_new(inner);
+                char *toks[MAX_ARGS];
+                int qt[MAX_ARGS];
+                int nt = 0, t;
+                while ((t = lexer_next(lx)) == TOK_WORD && nt < MAX_ARGS - 1) {
+                    toks[nt] = sh_strdup(lx->token_text);
+                    qt[nt] = lx->token_quoted;
+                    nt++;
+                }
+                lexer_free(lx);
+                int nw = nt;
+                char **ex = expand_words_q(toks, qt, &nw);
+                for (int k = 0; k < nt; k++) free(toks[k]);
+                var_array_clear(name);
+                for (int k = 0; k < nw; k++) var_array_set(name, k, ex[k]);
+                var_set_array_attr(name, 1);
+                for (int k = 0; k < nw; k++) free(ex[k]);
+                free(ex);
+            } else {
+                sh_assign(name, value ? value : "", 0, op);
+            }
+            bi_apply_attrs(name, opt_a, 1, 0);
+            free(name); free(value); free(inner);
         } else {
-            for (int j = 0; j < sh->nvars; j++)
-                if (strcmp(sh->vars[j].name, argv[i]) == 0)
-                    sh->vars[j].readonly = 1;
+            bi_apply_attrs(argv[i], opt_a, 1, 0);
         }
     }
     return 0;
 }
 
 /* ================================================================
- *  source filename  (or  . filename)
+ *  source filename [args...]  (or  . filename)
+ *
+ *  The file is executed with the streaming reader (sh_run_stream), which
+ *  accumulates physical lines until a logical command is complete — so
+ *  multi-line if/for/while and function definitions work, unlike the old
+ *  per-line execute_string() loop.
+ *
+ *  bash positional-parameter semantics: while the file runs, $1..$n are
+ *  set to the extra arguments given to `source` (and restored afterwards).
+ *  $? is the status of the last command executed from the file.
  * ================================================================ */
 int builtin_source(int argc, char **argv) {
     if (argc < 2) {
@@ -659,16 +960,33 @@ int builtin_source(int argc, char **argv) {
         return 1;
     }
 
-    char buf[MAX_LINE];
-    int ret = 0;
-    while (fgets(buf, sizeof(buf), f)) {
-        size_t len = strlen(buf);
-        while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
-            buf[--len] = '\0';
-        if (len > 0)
-            ret = execute_string(buf);
+    Shell *sh = shell_get();
+
+    /* save the caller's positional parameters */
+    char **old_pos = sh->positional;
+    int    old_npos = sh->npositional;
+
+    /* install the source arguments as the new $1..$n */
+    sh->positional = NULL;
+    sh->npositional = 0;
+    if (argc > 2) {
+        int n = argc - 2;
+        sh->positional = sh_malloc(n * sizeof(char *));
+        for (int i = 0; i < n; i++)
+            sh->positional[i] = sh_strdup(argv[i + 2]);
+        sh->npositional = n;
     }
+
+    int ret = sh_run_stream(f);
     fclose(f);
+
+    /* free the temporary positional parameters and restore the originals */
+    for (int i = 0; i < sh->npositional; i++)
+        free(sh->positional[i]);
+    free(sh->positional);
+    sh->positional = old_pos;
+    sh->npositional = old_npos;
+
     return ret;
 }
 
@@ -840,28 +1158,614 @@ int builtin_bg(int argc, char **argv) {
 }
 
 /* ================================================================
- *  history  — display command history
+ *  history [-c] [-d offset] [-a] [-r] [-w] [n]
+ *    (no option)  list all entries with line numbers
+ *    history N    list the last N entries (negative N: drop |N| oldest)
+ *    HISTTIMEFORMAT, if set, is used as a strftime() prefix per entry.
  * ================================================================ */
 int builtin_history(int argc, char **argv) {
     Shell *sh = shell_get();
+
+    int i = 1;
+    while (i < argc && argv[i][0] == '-' && argv[i][1]) {
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
+        if (strcmp(argv[i], "-c") == 0) { history_clear(); return 0; }
+        if (strcmp(argv[i], "-a") == 0) { history_append(); return 0; }
+        if (strcmp(argv[i], "-r") == 0) { history_read(); return 0; }
+        if (strcmp(argv[i], "-w") == 0) { history_write(); return 0; }
+        if (strcmp(argv[i], "-d") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "besh: history: -d: option requires an argument\n");
+                return 1;
+            }
+            int off = atoi(argv[i + 1]);
+            if (history_delete(off - 1) != 0) {
+                fprintf(stderr, "besh: history: %s: history position out of range\n",
+                        argv[i + 1]);
+                return 1;
+            }
+            return 0;
+        }
+        fprintf(stderr, "besh: history: %s: invalid option\n", argv[i]);
+        return 1;
+    }
+
     int start = 0;
     int count = sh->nhist;
-
-    if (argc > 1) {
-        count = atoi(argv[1]);
-        if (count < 0) {
-            start = sh->nhist + count;
+    if (i < argc) {
+        int n = atoi(argv[i]);
+        if (n < 0) {
+            start = sh->nhist + n;
             if (start < 0) start = 0;
             count = sh->nhist - start;
         } else {
-            start = sh->nhist - count;
+            start = sh->nhist - n;
             if (start < 0) start = 0;
+            count = sh->nhist - start;
         }
     }
 
-    for (int i = start; i < sh->nhist && count > 0; i++, count--) {
-        printf("%5d  %s\n", i + 1, sh->history[i]);
+    const char *fmt = sh_getenv("HISTTIMEFORMAT");
+    for (int k = start; k < sh->nhist && count > 0; k++, count--) {
+        char tb[256];
+        tb[0] = '\0';
+        if (fmt && *fmt && sh->hist_time[k] > 0) {
+            time_t t = (time_t)sh->hist_time[k];
+            struct tm *tm = localtime(&t);
+            if (tm) strftime(tb, sizeof(tb), fmt, tm);
+        }
+        printf("%5d  %s%s\n", k + 1, tb, sh->history[k]);
     }
+    return 0;
+}
+
+/* ================================================================
+ *  fc [-l] [-n] [-r] [-s [old=new] [cmd]] [-e [editor] [first] [last]]
+ *    -l           list history entries (line numbers, no timestamps)
+ *    -s           re-execute a history entry, optionally after old=new
+ *    -e [editor]  edit the selected entries, then execute them
+ *  editor defaults to $FCEDIT, then $EDITOR, then vi.
+ * ================================================================ */
+static int looks_like_range(const char *s) {
+    if (!s || !*s) return 0;
+    if (*s == '-') s++;
+    if (!*s) return 0;
+    for (; *s; s++)
+        if (*s < '0' || *s > '9') return 0;
+    return 1;
+}
+
+/* Resolve a first/last spec to a 0-based history index (N = 1-based
+ * absolute, -N = from the end, otherwise a prefix search, newest first). */
+static int hist_resolve(const char *spec, int *out) {
+    Shell *sh = shell_get();
+    if (!spec || !*spec) return 0;
+    char *end;
+    long v = strtol(spec, &end, 10);
+    if (end != spec && *end == '\0') {
+        int idx = (v > 0) ? (int)v - 1 : (v < 0) ? sh->nhist + (int)v : -1;
+        if (idx < 0 || idx >= sh->nhist) return 0;
+        *out = idx;
+        return 1;
+    }
+    for (int i = sh->nhist - 1; i >= 0; i--) {
+        if (strncmp(sh->history[i], spec, strlen(spec)) == 0) {
+            *out = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* first-occurrence `old=new` substitution */
+static char *hist_substitute(const char *cmd, const char *subst) {
+    const char *eq = strchr(subst, '=');
+    if (!eq) return sh_strdup(cmd);
+    char *old = sh_strndup(subst, eq - subst);
+    const char *new = eq + 1;
+    const char *pos = strstr(cmd, old);
+    if (!pos) { free(old); return sh_strdup(cmd); }
+    int pre = pos - cmd;
+    const char *tail = pos + strlen(old);
+    char *res = sh_malloc(pre + strlen(new) + strlen(tail) + 1);
+    memcpy(res, cmd, pre);
+    memcpy(res + pre, new, strlen(new));
+    strcpy(res + pre + strlen(new), tail);
+    free(old);
+    return res;
+}
+
+int builtin_fc(int argc, char **argv) {
+    Shell *sh = shell_get();
+    int list = 0, silent = 0, edit = 0;
+    const char *editor = NULL;
+
+    int i = 1;
+    while (i < argc) {
+        if (strcmp(argv[i], "-l") == 0) { list = 1; i++; continue; }
+        if (strcmp(argv[i], "-s") == 0) { silent = 1; i++; continue; }
+        if (strcmp(argv[i], "-n") == 0) { i++; continue; }   /* accepted */
+        if (strcmp(argv[i], "-r") == 0) { i++; continue; }   /* accepted */
+        if (strcmp(argv[i], "-e") == 0) {
+            edit = 1;
+            i++;
+            /* "-e editor" unless the next token already looks like a range */
+            if (i < argc && !looks_like_range(argv[i])) editor = argv[i++];
+            continue;
+        }
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
+        break;
+    }
+
+    const char *argfirst = (i < argc) ? argv[i++] : NULL;
+    const char *arglast  = (i < argc) ? argv[i++] : NULL;
+    int first = -1, last = -1;
+
+    if (silent) {
+        const char *subst = NULL, *cmdspec = NULL;
+        if (argfirst) {
+            if (strchr(argfirst, '=')) { subst = argfirst; cmdspec = arglast; }
+            else cmdspec = argfirst;
+        }
+        if (sh->nhist == 0) {
+            fprintf(stderr, "besh: fc: no command found\n");
+            return 1;
+        }
+        int idx = sh->nhist - 1;
+        if (cmdspec && !hist_resolve(cmdspec, &idx)) {
+            fprintf(stderr, "besh: fc: %s: history specification out of range\n", cmdspec);
+            return 1;
+        }
+        char *cmd = subst ? hist_substitute(sh->history[idx], subst)
+                          : sh_strdup(sh->history[idx]);
+        printf("%s\n", cmd);
+        history_add(cmd);
+        int ret = execute_string(cmd);
+        free(cmd);
+        return ret;
+    }
+
+    if (list || edit) {
+        if (argfirst) {
+            if (!hist_resolve(argfirst, &first)) {
+                fprintf(stderr, "besh: fc: %s: history specification out of range\n", argfirst);
+                return 1;
+            }
+            if (arglast) {
+                if (!hist_resolve(arglast, &last)) {
+                    fprintf(stderr, "besh: fc: %s: history specification out of range\n", arglast);
+                    return 1;
+                }
+            } else {
+                last = first;
+            }
+        } else {
+            last = sh->nhist - 1;
+            first = list ? (last - 15) : last;
+            if (first < 0) first = 0;
+        }
+        if (sh->nhist == 0 || last < 0) {
+            fprintf(stderr, "besh: fc: no command found\n");
+            return 1;
+        }
+        if (first > last) { int t = first; first = last; last = t; }
+
+        if (list) {
+            for (int k = first; k <= last && k < sh->nhist; k++)
+                printf("%5d  %s\n", k + 1, sh->history[k]);
+            return 0;
+        }
+
+        /* -e: dump selection to a temp file, run the editor, then execute */
+        const char *ed = editor;
+        if (!ed || !*ed) ed = sh_getenv("FCEDIT");
+        if (!ed || !*ed) ed = sh_getenv("EDITOR");
+        if (!ed || !*ed) ed = "vi";
+
+        char tmpl[] = "/tmp/besh_fcXXXXXX";
+        int fd = mkstemp(tmpl);
+        if (fd < 0) { perror("besh: fc"); return 1; }
+        FILE *fp = fdopen(fd, "w");
+        if (fp) {
+            for (int k = first; k <= last && k < sh->nhist; k++)
+                fprintf(fp, "%s\n", sh->history[k]);
+            fclose(fp);
+        } else {
+            close(fd);
+        }
+
+        char cmdline[MAX_PATH + 64];
+        snprintf(cmdline, sizeof(cmdline), "%s %s", ed, tmpl);
+        int sysret = system(cmdline);
+        (void)sysret;
+
+        FILE *rf = fopen(tmpl, "r");
+        int ret = 0;
+        if (rf) {
+            ret = sh_run_stream(rf);
+            fclose(rf);
+        }
+        unlink(tmpl);
+        return ret;
+    }
+
+    /* no mode flag: list the last entry (bash would invoke an editor) */
+    if (sh->nhist == 0) {
+        fprintf(stderr, "besh: fc: no command found\n");
+        return 1;
+    }
+    first = last = sh->nhist - 1;
+    printf("%5d  %s\n", first + 1, sh->history[first]);
+    return 0;
+}
+
+/* ================================================================
+ *  Programmable completion: `compgen` + `complete`
+ *
+ *  A registered CompSpec maps a command name to one of these candidate
+ *  sources (wordlist / -F function / -A action).  Tab completion in the
+ *  line editor consults compspec_find() before falling back to filenames.
+ *
+ *  A completion function may either
+ *    (a) print candidates, one per line, to standard output, or
+ *    (b) set the shell variable COMPREPLY to a space-separated list.
+ *  Both are supported; COMPREPLY wins when it is non-empty.  The function
+ *  is invoked with the current word as $1.
+ * ================================================================ */
+typedef struct { char **v; int n; int cap; } CandList;
+
+static void cand_add(CandList *l, const char *s) {
+    if (!s || !*s) return;
+    if (l->n >= l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 64;
+        l->v = sh_realloc(l->v, l->cap * sizeof(char *));
+    }
+    l->v[l->n++] = sh_strdup(s);
+}
+static int cand_has(const CandList *l, const char *s) {
+    for (int i = 0; i < l->n; i++)
+        if (strcmp(l->v[i], s) == 0) return 1;
+    return 0;
+}
+static void cand_add_unique(CandList *l, const char *s) {
+    if (!s || !*s) return;
+    if (cand_has(l, s)) return;
+    cand_add(l, s);
+}
+static void cand_add_filtered(CandList *l, const char *s, const char *prefix) {
+    if (!s || !*s) return;
+    if (prefix && *prefix && strncmp(s, prefix, strlen(prefix)) != 0) return;
+    cand_add_unique(l, s);
+}
+
+static const char *comp_keywords[] = {
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "while",
+    "until", "do", "done", "in", "function", "select", "time", "coproc",
+    "return", "break", "continue", NULL
+};
+
+/* external commands found in PATH + builtins/functions/aliases */
+static void gen_commands(CandList *l, const char *prefix) {
+    Shell *sh = shell_get();
+    for (int i = 0; i < builtin_count(); i++)
+        cand_add_filtered(l, builtin_name(i), prefix);
+    for (int i = 0; i < sh->nfuncs; i++)
+        cand_add_filtered(l, sh->funcs[i].name, prefix);
+    for (int i = 0; i < sh->naliases; i++)
+        cand_add_filtered(l, sh->aliases[i].name, prefix);
+
+    char *path = sh_getenv("PATH");
+    if (!path) path = "/usr/local/bin:/usr/bin:/bin";
+    char *pc = sh_strdup(path);
+    char *save = NULL;
+    for (char *dir = strtok_r(pc, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
+        if (!*dir) dir = ".";
+        DIR *d = opendir(dir);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.' &&
+                (!prefix || prefix[0] != '.')) continue;
+            if (prefix && *prefix &&
+                strncmp(e->d_name, prefix, strlen(prefix)) != 0) continue;
+            char full[MAX_PATH];
+            snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+            if (access(full, X_OK) == 0)
+                cand_add_unique(l, e->d_name);
+        }
+        closedir(d);
+    }
+    free(pc);
+}
+
+/* files (or directories only) matching `prefix`, honouring a path prefix */
+static void gen_files(CandList *l, const char *prefix, int dirs_only) {
+    char dir[MAX_PATH];
+    char lead[MAX_PATH + 2] = "";   /* the part of prefix we reproduce */
+    const char *base = prefix;
+    const char *slash = strrchr(prefix, '/');
+    if (slash) {
+        int dlen = (int)(slash - prefix);
+        if (dlen == 0) {
+            snprintf(dir, sizeof(dir), "/");
+            snprintf(lead, sizeof(lead), "/");
+        } else {
+            snprintf(dir, sizeof(dir), "%.*s", dlen, prefix);
+            snprintf(lead, sizeof(lead), "%.*s/", dlen, prefix);
+        }
+        base = slash + 1;
+    } else {
+        snprintf(dir, sizeof(dir), ".");
+    }
+
+    char *expanded = NULL;
+    if (dir[0] == '~') {
+        expanded = tilde_expand(dir);
+        if (expanded) { snprintf(dir, sizeof(dir), "%s", expanded); free(expanded); }
+    }
+
+    DIR *d = opendir(dir);
+    if (!d) return;
+    size_t bl = strlen(base);
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            if (bl == 0 || base[0] != '.') continue;
+        }
+        if (strncmp(e->d_name, base, bl) != 0) continue;
+        char full[MAX_PATH];
+        snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+        struct stat st;
+        int isdir = (stat(full, &st) == 0 && S_ISDIR(st.st_mode));
+        if (dirs_only && !isdir) continue;
+        char cand[MAX_PATH + 4];
+        snprintf(cand, sizeof(cand), "%s%s%s", lead, e->d_name, isdir ? "/" : "");
+        cand_add_unique(l, cand);
+    }
+    closedir(d);
+}
+
+/* run a completion function, capturing stdout, then collect candidates */
+static void run_comp_func(const char *func, const char *prefix, CandList *l) {
+    char tmpl[] = "/tmp/besh_compXXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return;
+
+    /* single-quote the current word for the function's $1 */
+    char q[1024];
+    int qo = 0;
+    q[qo++] = '\'';
+    for (const char *p = prefix; *p && qo < (int)sizeof(q) - 6; p++) {
+        if (*p == '\'') { memcpy(q + qo, "'\\''", 4); qo += 4; }
+        else q[qo++] = *p;
+    }
+    q[qo++] = '\'';
+    q[qo] = '\0';
+
+    char cmd[2048];
+    if ((size_t)(qo + strlen(func) + 2) >= sizeof(cmd)) {
+        close(fd);
+        unlink(tmpl);
+        return;
+    }
+    snprintf(cmd, sizeof(cmd), "%s %s", func, q);
+
+    /* capture the function's stdout into the temp file.  Flush any pending
+     * stdout (e.g. the banner's trailing reset) to the real tty first, so
+     * it does not pollute the captured candidates. */
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    dup2(fd, STDOUT_FILENO);
+    close(fd);
+    sh_unsetenv("COMPREPLY");     /* detect whether the function sets it */
+    execute_string(cmd);
+    fflush(stdout);
+    if (saved >= 0) { dup2(saved, STDOUT_FILENO); close(saved); }
+
+    char *creply = sh_getenv("COMPREPLY");
+    if (creply && *creply) {
+        char *cr = sh_strdup(creply);
+        char *save = NULL;
+        for (char *w = strtok_r(cr, " \t\n", &save); w;
+             w = strtok_r(NULL, " \t\n", &save))
+            cand_add_filtered(l, w, prefix);
+        free(cr);
+    } else {
+        FILE *f = fopen(tmpl, "r");
+        if (f) {
+            char buf[MAX_LINE];
+            while (fgets(buf, sizeof(buf), f)) {
+                size_t len = strlen(buf);
+                while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+                    buf[--len] = '\0';
+                if (len > 0) cand_add_filtered(l, buf, prefix);
+            }
+            fclose(f);
+        }
+    }
+    unlink(tmpl);
+}
+
+int compgen_generate(const char *action, const char *wordlist, const char *func,
+                     const char *prefix, char ***out, int *n) {
+    CandList l;
+    memset(&l, 0, sizeof(l));
+    if (!prefix) prefix = "";
+    Shell *sh = shell_get();
+
+    if (wordlist) {
+        char *wl = sh_strdup(wordlist);
+        char *save = NULL;
+        for (char *w = strtok_r(wl, " \t\n", &save); w;
+             w = strtok_r(NULL, " \t\n", &save))
+            cand_add_filtered(&l, w, prefix);
+        free(wl);
+    }
+
+    if (action) {
+        if (strcmp(action, "builtin") == 0) {
+            for (int i = 0; i < builtin_count(); i++)
+                cand_add_filtered(&l, builtin_name(i), prefix);
+        } else if (strcmp(action, "function") == 0) {
+            for (int i = 0; i < sh->nfuncs; i++)
+                cand_add_filtered(&l, sh->funcs[i].name, prefix);
+        } else if (strcmp(action, "alias") == 0) {
+            for (int i = 0; i < sh->naliases; i++)
+                cand_add_filtered(&l, sh->aliases[i].name, prefix);
+        } else if (strcmp(action, "variable") == 0) {
+            for (int i = 0; i < sh->nvars; i++)
+                cand_add_filtered(&l, sh->vars[i].name, prefix);
+        } else if (strcmp(action, "keyword") == 0) {
+            for (int i = 0; comp_keywords[i]; i++)
+                cand_add_filtered(&l, comp_keywords[i], prefix);
+        } else if (strcmp(action, "file") == 0) {
+            gen_files(&l, prefix, 0);
+        } else if (strcmp(action, "directory") == 0 ||
+                   strcmp(action, "dir") == 0) {
+            gen_files(&l, prefix, 1);
+        } else if (strcmp(action, "command") == 0) {
+            gen_commands(&l, prefix);
+        }
+        /* unknown actions simply produce nothing */
+    }
+
+    if (func) run_comp_func(func, prefix, &l);
+
+    *out = l.v;
+    *n = l.n;
+    return l.n;
+}
+
+void compgen_free(char **matches, int n) {
+    if (!matches) return;
+    for (int i = 0; i < n; i++) free(matches[i]);
+    free(matches);
+}
+
+/* ---- completion rule registry --------------------------------- */
+CompSpec *compspec_find(const char *name) {
+    Shell *sh = shell_get();
+    for (CompSpec *c = sh->compspecs; c; c = c->next)
+        if (strcmp(c->name, name) == 0) return c;
+    return NULL;
+}
+
+int compspec_add(const char *name, const char *wordlist,
+                 const char *func, const char *action) {
+    Shell *sh = shell_get();
+    CompSpec *c = compspec_find(name);
+    if (!c) {
+        c = sh_malloc(sizeof(CompSpec));
+        memset(c, 0, sizeof(*c));
+        c->name = sh_strdup(name);
+        c->next = sh->compspecs;
+        sh->compspecs = c;
+    }
+    free(c->wordlist); c->wordlist = wordlist ? sh_strdup(wordlist) : NULL;
+    free(c->func);     c->func     = func     ? sh_strdup(func)     : NULL;
+    free(c->action);   c->action   = action   ? sh_strdup(action)   : NULL;
+    return 0;
+}
+
+int compspec_remove(const char *name) {
+    Shell *sh = shell_get();
+    CompSpec *prev = NULL;
+    for (CompSpec *c = sh->compspecs; c; prev = c, c = c->next) {
+        if (strcmp(c->name, name) == 0) {
+            if (prev) prev->next = c->next;
+            else sh->compspecs = c->next;
+            free(c->name); free(c->wordlist); free(c->func); free(c->action);
+            free(c);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void compspec_free_all(void) {
+    Shell *sh = shell_get();
+    CompSpec *c = sh->compspecs;
+    while (c) {
+        CompSpec *next = c->next;
+        free(c->name); free(c->wordlist); free(c->func); free(c->action);
+        free(c);
+        c = next;
+    }
+    sh->compspecs = NULL;
+}
+
+int builtin_compgen(int argc, char **argv) {
+    const char *action = NULL, *wordlist = NULL, *func = NULL, *prefix = "";
+    int i = 1;
+    while (i < argc) {
+        if (strcmp(argv[i], "-A") == 0 && i + 1 < argc) { action = argv[++i]; i++; continue; }
+        if (strcmp(argv[i], "-W") == 0 && i + 1 < argc) { wordlist = argv[++i]; i++; continue; }
+        if (strcmp(argv[i], "-F") == 0 && i + 1 < argc) { func = argv[++i]; i++; continue; }
+        if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "-P") == 0 ||
+             strcmp(argv[i], "-S") == 0 || strcmp(argv[i], "-X") == 0 ||
+             strcmp(argv[i], "-G") == 0) && i + 1 < argc) { i += 2; continue; }
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
+        break;
+    }
+    if (i < argc) prefix = argv[i];
+
+    char **out = NULL;
+    int n = 0;
+    compgen_generate(action, wordlist, func, prefix, &out, &n);
+    for (int k = 0; k < n; k++)
+        printf("%s\n", out[k]);
+    compgen_free(out, n);
+    return n > 0 ? 0 : 1;
+}
+
+int builtin_complete(int argc, char **argv) {
+    Shell *sh = shell_get();
+    const char *wordlist = NULL, *func = NULL, *action = NULL;
+    char *cmds[256];
+    int ncmd = 0;
+    int print = 0, remove = 0;
+
+    int i = 1;
+    while (i < argc) {
+        if (strcmp(argv[i], "-p") == 0) { print = 1; i++; continue; }
+        if (strcmp(argv[i], "-r") == 0) { remove = 1; i++; continue; }
+        if (strcmp(argv[i], "-W") == 0 && i + 1 < argc) { wordlist = argv[++i]; i++; continue; }
+        if (strcmp(argv[i], "-F") == 0 && i + 1 < argc) { func = argv[++i]; i++; continue; }
+        if (strcmp(argv[i], "-A") == 0 && i + 1 < argc) { action = argv[++i]; i++; continue; }
+        if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "-G") == 0 ||
+             strcmp(argv[i], "-P") == 0 || strcmp(argv[i], "-S") == 0 ||
+             strcmp(argv[i], "-X") == 0) && i + 1 < argc) { i += 2; continue; }
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
+        break;
+    }
+    for (; i < argc && ncmd < 256; i++)
+        cmds[ncmd++] = argv[i];
+
+    if (print) {
+        for (CompSpec *c = sh->compspecs; c; c = c->next) {
+            printf("complete");
+            if (c->wordlist) printf(" -W '%s'", c->wordlist);
+            if (c->func)     printf(" -F %s", c->func);
+            if (c->action)   printf(" -A %s", c->action);
+            printf(" %s\n", c->name);
+        }
+        return 0;
+    }
+
+    if (remove) {
+        if (ncmd == 0) compspec_free_all();
+        else for (int k = 0; k < ncmd; k++) compspec_remove(cmds[k]);
+        return 0;
+    }
+
+    if (ncmd == 0) {
+        fprintf(stderr, "besh: complete: usage: complete [-W wordlist] "
+                        "[-F func] [-A action] [-p] [-r] [name ...]\n");
+        return 1;
+    }
+
+    for (int k = 0; k < ncmd; k++)
+        compspec_add(cmds[k], wordlist, func, action);
     return 0;
 }
 
@@ -881,7 +1785,17 @@ int builtin_set(int argc, char **argv) {
     }
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--") == 0) continue;
+        if (strcmp(argv[i], "--") == 0) {
+            /* `set -- a b c` replaces the positional parameters */
+            for (int k = 0; k < sh->npositional; k++) free(sh->positional[k]);
+            free(sh->positional);
+            int n = argc - i - 1;
+            sh->positional = (n > 0) ? sh_malloc(n * sizeof(char *)) : NULL;
+            for (int k = 0; k < n; k++)
+                sh->positional[k] = sh_strdup(argv[i + 1 + k]);
+            sh->npositional = n;
+            return 0;
+        }
         if (strcmp(argv[i], "-x") == 0) { sh->opt_xtrace = 1; continue; }
         if (strcmp(argv[i], "+x") == 0) { sh->opt_xtrace = 0; continue; }
         if (strcmp(argv[i], "-v") == 0) { sh->opt_verbose = 1; continue; }
@@ -1215,11 +2129,11 @@ static int builtin_help(int argc, char **argv) {
         else
             printf("besh: help: no help for %s\n", argv[1]);
     } else {
-        printf("besh built-in commands (38):\n");
-        printf("  .  abbr  alias  bg  break  [  cd  continue  dirs  echo\n");
-        printf("  exec  exit  export  false  fg  help  history  jobs  popd\n");
-        printf("  pushd  pwd  read  readonly  return  set  setopt  shift\n");
-        printf("  source  test  times  trap  true  type  umask  unalias\n");
+        printf("besh built-in commands (41):\n");
+        printf("  .  abbr  alias  bg  break  [  cd  compgen  complete  continue\n");
+        printf("  dirs  echo  exec  exit  export  false  fc  fg  help  history\n");
+        printf("  jobs  popd  pushd  pwd  read  readonly  return  set  setopt\n");
+        printf("  shift  source  test  times  trap  true  type  umask  unalias\n");
         printf("  unset  unsetopt  wait\n");
         printf("Type 'help name' for more info.\n");
         printf("\nfish/zsh features: autosuggestions (right-arrow/Tab),\n");
@@ -1256,6 +2170,7 @@ static int builtin_return(int argc, char **argv) {
     Shell *sh = shell_get();
     int code = (argc > 1) ? atoi(argv[1]) : sh->exit_status;
     sh->exit_status = code;
+    sh->return_request = 1;   /* unwind the enclosing function / sourced file */
     return code;
 }
 
@@ -1283,6 +2198,9 @@ static const BuiltinEntry builtins[] = {
     {"fg",      builtin_fg},
     {"bg",      builtin_bg},
     {"history", builtin_history},
+    {"fc",      builtin_fc},
+    {"compgen", builtin_compgen},
+    {"complete",builtin_complete},
     {"set",     builtin_set},
     {"read",    builtin_read},
     {"test",    builtin_test},
@@ -1305,6 +2223,9 @@ static const BuiltinEntry builtins[] = {
     {"setopt",  builtin_setopt},
     {"unsetopt",builtin_unsetopt},
     {"readonly",builtin_readonly},
+    {"declare", builtin_declare},
+    {"typeset", builtin_typeset},
+    {"local",   builtin_local},
     {"help",    builtin_help},
     {NULL, NULL}
 };
@@ -1319,4 +2240,16 @@ builtin_fn builtin_lookup(const char *name) {
 
 int builtin_is(const char *name) {
     return builtin_lookup(name) != NULL;
+}
+
+/* number of builtins / name of the i-th builtin (for compgen -A builtin) */
+int builtin_count(void) {
+    int n = 0;
+    while (builtins[n].name) n++;
+    return n;
+}
+
+const char *builtin_name(int i) {
+    if (i < 0 || i >= builtin_count()) return NULL;
+    return builtins[i].name;
 }

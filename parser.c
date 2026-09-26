@@ -46,6 +46,8 @@ void ast_free(ASTNode *node) {
             for (int i = 0; i < node->argc; i++) free(node->argv[i]);
             free(node->argv);
         }
+        free(node->argv_quoted);
+        node->argv_quoted = NULL;
         {
             Redir *r = node->redirs;
             while (r) {
@@ -237,6 +239,7 @@ static ASTNode *parse_simple_command(Lexer *l) {
     ASTNode *node = ast_new(NODE_COMMAND);
     node->argv_cap = 64;
     node->argv = sh_malloc(node->argv_cap * sizeof(char *));
+    node->argv_quoted = sh_malloc(node->argv_cap * sizeof(int));
     node->argc = 0;
     node->redirs = NULL;
 
@@ -273,7 +276,10 @@ static ASTNode *parse_simple_command(Lexer *l) {
                 node->argv_cap *= 2;
                 node->argv = sh_realloc(node->argv,
                                         node->argv_cap * sizeof(char *));
+                node->argv_quoted = sh_realloc(node->argv_quoted,
+                                        node->argv_cap * sizeof(int));
             }
+            node->argv_quoted[node->argc] = l->token_quoted;
             node->argv[node->argc++] = sh_strdup(l->token_text);
             node->argv[node->argc] = NULL;
             lexer_next(l);
@@ -302,14 +308,23 @@ static ASTNode *parse_simple_command(Lexer *l) {
 
                 int new_argc = na + (node->argc - 1);
                 char **na_argv = sh_malloc((new_argc + 1) * sizeof(char *));
-                for (int k = 0; k < na; k++) na_argv[k] = awords[k];
-                for (int k = 1; k < node->argc; k++)
+                int *na_quoted = sh_malloc((new_argc + 1) * sizeof(int));
+                for (int k = 0; k < na; k++) {
+                    na_argv[k] = awords[k];
+                    na_quoted[k] = 0;
+                }
+                for (int k = 1; k < node->argc; k++) {
                     na_argv[na + k - 1] = sh_strdup(node->argv[k]);
+                    na_quoted[na + k - 1] = node->argv_quoted[k];
+                }
                 na_argv[new_argc] = NULL;
+                na_quoted[new_argc] = 0;
 
                 for (int k = 0; k < node->argc; k++) free(node->argv[k]);
                 free(node->argv);
+                free(node->argv_quoted);
                 node->argv = na_argv;
+                node->argv_quoted = na_quoted;
                 node->argc = new_argc;
                 node->argv_cap = new_argc + 1;
                 break;
@@ -579,6 +594,7 @@ static ASTNode *parse_for(Lexer *l) {
         ASTNode *words_node = ast_new(NODE_COMMAND);
         words_node->argv_cap = 64;
         words_node->argv = sh_malloc(words_node->argv_cap * sizeof(char *));
+        words_node->argv_quoted = sh_malloc(words_node->argv_cap * sizeof(int));
         words_node->argc = 0;
 
         while (l->token_type == TOK_WORD &&
@@ -588,7 +604,10 @@ static ASTNode *parse_for(Lexer *l) {
                 words_node->argv_cap *= 2;
                 words_node->argv = sh_realloc(words_node->argv,
                     words_node->argv_cap * sizeof(char *));
+                words_node->argv_quoted = sh_realloc(words_node->argv_quoted,
+                    words_node->argv_cap * sizeof(int));
             }
+            words_node->argv_quoted[words_node->argc] = l->token_quoted;
             words_node->argv[words_node->argc++] = sh_strdup(l->token_text);
             lexer_next(l);
         }

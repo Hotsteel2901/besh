@@ -1215,11 +1215,12 @@ static int builtin_help(int argc, char **argv) {
         else
             printf("besh: help: no help for %s\n", argv[1]);
     } else {
-        printf("besh built-in commands:\n");
-        printf("  abbr  alias  bg  cd  dirs  echo  exec  exit  export  false\n");
-        printf("  fg  help  history  jobs  popd  pushd  pwd  read  readonly\n");
-        printf("  set  setopt  shift  source  test  times  trap  true  type\n");
-        printf("  umask  unalias  unset  unsetopt  [\n");
+        printf("besh built-in commands (38):\n");
+        printf("  .  abbr  alias  bg  break  [  cd  continue  dirs  echo\n");
+        printf("  exec  exit  export  false  fg  help  history  jobs  popd\n");
+        printf("  pushd  pwd  read  readonly  return  set  setopt  shift\n");
+        printf("  source  test  times  trap  true  type  umask  unalias\n");
+        printf("  unset  unsetopt  wait\n");
         printf("Type 'help name' for more info.\n");
         printf("\nfish/zsh features: autosuggestions (right-arrow/Tab),\n");
         printf("  syntax highlighting, abbr, Ctrl-R reverse search,\n");

@@ -210,7 +210,7 @@ static Redir *parse_redirection(Lexer *l) {
             fprintf(stderr, "besh: parse error: expected here-document delimiter\n");
             r->filename = sh_strdup("EOF");
         } else {
-            r->filename = sh_strdup(l->token_text);
+            r->filename = unescape_token(l->token_text);
             r->quoted = l->token_quoted;
             /* read heredoc content */
             r->heredoc = lexer_heredoc(l, r->filename,
@@ -224,7 +224,7 @@ static Redir *parse_redirection(Lexer *l) {
             fprintf(stderr, "besh: parse error: expected filename after redirection\n");
             r->filename = sh_strdup("/dev/null");
         } else {
-            r->filename = sh_strdup(l->token_text);
+            r->filename = unescape_token(l->token_text);
         }
         lexer_next(l);
     }
@@ -289,13 +289,29 @@ static ASTNode *parse_simple_command(Lexer *l) {
         Shell *sh = shell_get();
         for (int i = 0; i < sh->naliases; i++) {
             if (strcmp(node->argv[0], sh->aliases[i].name) == 0) {
-                /* replace first word with alias expansion */
-                char *exp = sh_strdup(sh->aliases[i].value);
-                /* parse the alias value and insert its words */
-                /* For simplicity, just replace argv[0] with expanded value */
-                /* A full implementation would lex the alias value */
-                free(node->argv[0]);
-                node->argv[0] = exp;
+                /* lex the alias value so that it can expand into several
+                 * words (e.g. alias ll="ls -l") while still honouring any
+                 * quoting present in the value */
+                Lexer *al = lexer_new(sh->aliases[i].value);
+                char *awords[64];
+                int na = 0;
+                while (na < 63 && lexer_next(al) == TOK_WORD)
+                    awords[na++] = sh_strdup(al->token_text);
+                lexer_free(al);
+                if (na == 0) break;
+
+                int new_argc = na + (node->argc - 1);
+                char **na_argv = sh_malloc((new_argc + 1) * sizeof(char *));
+                for (int k = 0; k < na; k++) na_argv[k] = awords[k];
+                for (int k = 1; k < node->argc; k++)
+                    na_argv[na + k - 1] = sh_strdup(node->argv[k]);
+                na_argv[new_argc] = NULL;
+
+                for (int k = 0; k < node->argc; k++) free(node->argv[k]);
+                free(node->argv);
+                node->argv = na_argv;
+                node->argc = new_argc;
+                node->argv_cap = new_argc + 1;
                 break;
             }
         }
@@ -358,6 +374,7 @@ static ASTNode *parse_command(Lexer *l) {
         if (l->pos < l->len) {
             int save_pos = l->pos;
             int save_type = l->token_type;
+            int save_quoted = l->token_quoted;
             char *save_text = sh_strdup(l->token_text);   /* copy before lexer_next frees it */
 
             int next = lexer_next(l);
@@ -376,12 +393,14 @@ static ASTNode *parse_command(Lexer *l) {
                 l->token_text = save_text;
                 l->pos = save_pos;
                 l->token_type = save_type;
+                l->token_quoted = save_quoted;
             } else {
                 /* rewind */
                 free(l->token_text);
                 l->token_text = save_text;
                 l->pos = save_pos;
                 l->token_type = save_type;
+                l->token_quoted = save_quoted;
             }
         }
 

@@ -339,12 +339,32 @@ char *expand_string(const char *str) {
     while (*p) {
         if (*p == '\\' && *(p+1)) {
             char nx = *(p+1);
-            if (nx == '$' || nx == '`' || nx == '"' || nx == '\\' || nx == '\n') {
-                p++;
-                if (blen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
-                buf[blen++] = *p++;
+            if (nx == '\n') {            /* line continuation */
+                p += 2;
                 continue;
             }
+            if (nx == '$' || nx == '`' || nx == '"' || nx == '\'' ||
+                nx == '\\' || nx == '~') {
+                /* protected literal — unescape it now */
+                if (blen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
+                buf[blen++] = nx;
+                p += 2;
+                continue;
+            }
+            if (nx == '*' || nx == '?' || nx == '[' || nx == ']' ||
+                nx == '{' || nx == '}') {
+                /* keep protected: brace/glob stages must still see the escape */
+                if (blen + 3 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
+                buf[blen++] = '\\';
+                buf[blen++] = nx;
+                p += 2;
+                continue;
+            }
+            /* unknown escape — copy backslash literally */
+            if (blen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
+            buf[blen++] = '\\';
+            p++;
+            continue;
         }
         /* arithmetic expansion: $(( ... )) */
         if (*p == '$' && *(p+1) == '(' && *(p+2) == '(') {
@@ -421,26 +441,16 @@ char *expand_string(const char *str) {
             }
             continue;
         }
-        if (*p == '~' && (p == str || *(p-1) == ' ') &&
-            (*(p+1) == '\0' || *(p+1) == '/' || *(p+1) == ' ')) {
+        if (*p == '~' && p == str &&
+            (*(p+1) == '\0' || *(p+1) == '/')) {
             char *exp = tilde_expand(p);
             int elen = strlen(exp);
             while (blen + elen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
             memcpy(buf + blen, exp, elen);
             blen += elen;
             free(exp);
-            /* advance past the tilde pattern */
-            p++; while (*p && *p != '/' && *p != ' ' && *p != ':') p++;
-            continue;
-        }
-        if (*p == '\'') {
-            /* skip single-quoted sections as-is */
-            p++;
-            while (*p && *p != '\'') {
-                if (blen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
-                buf[blen++] = *p++;
-            }
-            if (*p) p++;
+            /* tilde_expand() consumed the whole word (p == str) */
+            p += strlen(p);
             continue;
         }
         if (blen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
@@ -448,6 +458,61 @@ char *expand_string(const char *str) {
     }
     buf[blen] = '\0';
     return buf;
+}
+
+/* ---- quote-protection removal --------------------------------- *
+ * The lexer protects every literal special character with a backslash.
+ * expand_string() already unescapes the expansion set ($ ` " ' \ ~), so
+ * what is left here is the glob/brace set, which must survive until the
+ * glob decision has been made.  unescape_word() is the final step. */
+char *unescape_word(const char *s) {
+    if (!s) return sh_strdup("");
+    char *out = sh_malloc(strlen(s) + 1);
+    int o = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '\\' && *(p+1) &&
+            (*(p+1) == '*' || *(p+1) == '?' || *(p+1) == '[' ||
+             *(p+1) == ']' || *(p+1) == '{' || *(p+1) == '}')) {
+            out[o++] = *(p+1);
+            p++;
+            continue;
+        }
+        out[o++] = *p;
+    }
+    out[o] = '\0';
+    return out;
+}
+
+/* does the word contain a glob character that is *not* backslash-escaped? */
+static int has_unescaped_glob(const char *s) {
+    for (const char *p = s; *p; p++) {
+        if (*p == '\\' && *(p+1)) { p++; continue; }
+        if (*p == '*' || *p == '?' || *p == '[') return 1;
+    }
+    return 0;
+}
+
+/* remove *all* quote-protection backslashes from a lexer token.
+ * Used for contexts that do not undergo expansion (redirection file
+ * names, here-document delimiters) where quotes are simply removed. */
+char *unescape_token(const char *s) {
+    if (!s) return sh_strdup("");
+    char *out = sh_malloc(strlen(s) + 1);
+    int o = 0;
+    for (const char *p = s; *p; ) {
+        char n = *(p+1);
+        if (*p == '\\' && n &&
+            (n == '$' || n == '`' || n == '"' || n == '\'' || n == '\\' ||
+             n == '~' || n == '*' || n == '?' || n == '[' || n == ']' ||
+             n == '{' || n == '}')) {
+            out[o++] = n;
+            p += 2;
+        } else {
+            out[o++] = *p++;
+        }
+    }
+    out[o] = '\0';
+    return out;
 }
 
 /* ---- expand an array of words ---------------------------------- */
@@ -465,31 +530,25 @@ char **expand_words(char **words, int *count) {
         free(expanded);
 
         for (int b = 0; b < bc && nresult < MAX_ARGS - 1; b++) {
-            /* if noglob is set, skip globbing */
-            if (sh->opt_noglob) {
-                result[nresult++] = br[b];
+            /* if noglob is set, or the word has no active glob char,
+             * keep it as a literal (after removing quote protection) */
+            if (sh->opt_noglob || !has_unescaped_glob(br[b])) {
+                result[nresult++] = unescape_word(br[b]);
+                free(br[b]);
                 continue;
             }
 
-            /* check if the word contains glob characters */
-            int has_glob = 0;
-            for (char *p = br[b]; *p && !has_glob; p++)
-                if (*p == '*' || *p == '?' || *p == '[') has_glob = 1;
-
-            if (has_glob) {
-                int gcount = 0;
-                char **globs = glob_expand(br[b], &gcount);
-                if (gcount > 0) {
-                    for (int j = 0; j < gcount && nresult < MAX_ARGS - 1; j++)
-                        result[nresult++] = globs[j];
-                    free(globs);
-                    free(br[b]);
-                } else {
-                    /* no match — keep literal */
-                    result[nresult++] = br[b];
-                }
+            int gcount = 0;
+            char **globs = glob_expand(br[b], &gcount);
+            if (gcount > 0) {
+                for (int j = 0; j < gcount && nresult < MAX_ARGS - 1; j++)
+                    result[nresult++] = globs[j];
+                free(globs);
+                free(br[b]);
             } else {
-                result[nresult++] = br[b];
+                /* no match — keep literal */
+                result[nresult++] = unescape_word(br[b]);
+                free(br[b]);
             }
         }
         free(br);

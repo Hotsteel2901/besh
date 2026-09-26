@@ -5,6 +5,21 @@ import { Canvas, useFrame } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import { useIsDesktop } from "@/app/hooks/useIsDesktop";
 import { useReducedMotion } from "@/app/hooks/useReducedMotion";
+import { useInViewport } from "@/app/hooks/useInViewport";
+import { useWebGL } from "@/app/hooks/useWebGL";
+
+const TREE = `NODE_LIST
+├── CMD(cat)
+│   └── REDIR(<<HD)
+└── CMD(echo)
+    └── ARG(done)`;
+
+const LEGEND = [
+  { color: "#A78BFA", label: "list" },
+  { color: "#4ADE80", label: "builtin" },
+  { color: "#FB7185", label: "external / arg" },
+  { color: "#C4B5FD", label: "redirection" },
+];
 
 function TreeNode({ position, color }: { position: [number, number, number]; color: string }) {
   return (
@@ -42,10 +57,10 @@ function AstScene() {
 
   const nodes = [
     { label: "NODE_LIST", pos: [0, 2, 0] as [number, number, number], color: "#7C3AED" },
-    { label: "CMD(cat)", pos: [-1.5, 0, 0] as [number, number, number], color: "#00FF41" },
-    { label: "CMD(echo)", pos: [1.5, 0, 0] as [number, number, number], color: "#F43F5E" },
+    { label: "CMD(cat)", pos: [-1.5, 0, 0] as [number, number, number], color: "#4ADE80" },
+    { label: "CMD(echo)", pos: [1.5, 0, 0] as [number, number, number], color: "#FB7185" },
     { label: "REDIR(<<HD)", pos: [-2.5, -2, 0] as [number, number, number], color: "#A78BFA" },
-    { label: "ARG(done)", pos: [1.5, -2, 0] as [number, number, number], color: "#F43F5E" },
+    { label: "ARG(done)", pos: [1.5, -2, 0] as [number, number, number], color: "#FB7185" },
   ];
 
   const edges = [
@@ -71,34 +86,54 @@ function AstScene() {
 
 export default function AstVisualizer() {
   const isDesktop = useIsDesktop();
+  const webgl = useWebGL();
+  const { ref, inView } = useInViewport<HTMLElement>(0.2);
+  const show3D = isDesktop && webgl;
 
   return (
-    <section className="relative z-10 py-20 px-4 max-w-5xl mx-auto">
-      <div className="text-center mb-8">
-        <h2 className="font-display text-2xl md:text-4xl font-black tracking-[0.15em] uppercase text-glow mb-4">
-          /ast
-        </h2>
-        <p className="font-mono text-sm text-[#A78BFA]/60 max-w-xl mx-auto">
-          Every command becomes a node in an Abstract Syntax Tree
+    <section id="ast" ref={ref} className="shell section">
+      <div className="mb-10 text-center">
+        <p className="kicker">/ast</p>
+        <h2 className="section-title">Syntax tree</h2>
+        <p className="section-sub">
+          Every command becomes a node in an abstract syntax tree — this is how{" "}
+          <span className="text-[color:var(--green)]">cat &lt;&lt;EOF</span> is parsed.
         </p>
       </div>
 
-      {isDesktop ? (
-        <div className="w-full h-80 md:h-96 neon-border rounded-sm overflow-hidden">
-          <Canvas camera={{ position: [0, 0, 8], fov: 50 }} dpr={[1, 1.5]}>
-            <AstScene />
-            <OrbitControls enableZoom={false} enablePan={false} />
-          </Canvas>
-        </div>
+      {show3D ? (
+        <>
+          <div className="panel h-80 overflow-hidden md:h-96">
+            {/* rendering stops while the section is off-screen */}
+            <Canvas
+              camera={{ position: [0, 0, 8], fov: 50 }}
+              dpr={[1, 1.5]}
+              frameloop={inView ? "always" : "never"}
+            >
+              <AstScene />
+              <OrbitControls enableZoom={false} enablePan={false} />
+            </Canvas>
+          </div>
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-4 font-mono text-xs text-[color:var(--text-3)]">
+            <span>drag to rotate</span>
+            {LEGEND.map((item) => (
+              <span key={item.label} className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-[2px]" style={{ background: item.color }} />
+                {item.label}
+              </span>
+            ))}
+          </div>
+        </>
       ) : (
-        <div className="neon-border rounded-sm p-6 bg-[#0F0F23]/80">
-          <pre className="font-mono text-xs md:text-sm text-[#00FF41] overflow-x-auto">
-{`NODE_LIST
-├── CMD(cat)
-│   └── REDIR(<<HD)
-└── CMD(echo)
-    └── ARG(done)`}
+        <div className="panel mx-auto max-w-2xl p-6">
+          <pre className="overflow-x-auto font-mono text-xs leading-relaxed text-[color:var(--green)] md:text-sm">
+            {TREE}
           </pre>
+          {isDesktop && (
+            <p className="mt-3 font-mono text-xs text-[color:var(--text-3)]">
+              WebGL isn&apos;t available here, so the tree is shown as text.
+            </p>
+          )}
         </div>
       )}
     </section>

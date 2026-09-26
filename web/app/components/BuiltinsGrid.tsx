@@ -1,70 +1,68 @@
-"use client";
 import GlitchCard from "./GlitchCard";
-import { useIsDesktop } from "@/app/hooks/useIsDesktop";
 
-const BUILTINS = [
-  { name: "echo", desc: "Print to stdout" },
+/* Mirrors the builtin table in builtins.c — 38 entries. */
+const BUILTINS: { name: string; desc: string; fishZsh?: boolean }[] = [
   { name: "cd", desc: "Change directory" },
+  { name: "echo", desc: "Print arguments" },
   { name: "pwd", desc: "Print working dir" },
-  { name: "ls", desc: "List directory (via exec)" },
-  { name: "export", desc: "Set env variables" },
-  { name: "unset", desc: "Remove variables" },
+  { name: "export", desc: "Mark for export" },
+  { name: "unset", desc: "Drop a variable" },
   { name: "readonly", desc: "Freeze a variable" },
   { name: "alias", desc: "Define aliases" },
-  { name: "unalias", desc: "Remove aliases" },
-  { name: "abbr", desc: "Fish-style abbreviation" },
-  { name: "source", desc: "Execute script file" },
-  { name: "exit", desc: "Exit the shell" },
+  { name: "unalias", desc: "Remove an alias" },
+  { name: "source", desc: "Run a script file" },
+  { name: ".", desc: "Alias of source" },
+  { name: "exit", desc: "Leave the shell" },
+  { name: "type", desc: "Resolve a command" },
   { name: "jobs", desc: "List background jobs" },
-  { name: "fg", desc: "Foreground job" },
-  { name: "bg", desc: "Background job" },
+  { name: "fg", desc: "Bring a job to front" },
+  { name: "bg", desc: "Resume a job in back" },
   { name: "wait", desc: "Wait for jobs" },
   { name: "history", desc: "Command history" },
-  { name: "read", desc: "Read from stdin" },
-  { name: "test/[", desc: "Conditional eval" },
+  { name: "read", desc: "Read a line from stdin" },
+  { name: "test", desc: "Conditional eval" },
+  { name: "[", desc: "Bracket form of test" },
   { name: "true", desc: "Return 0" },
   { name: "false", desc: "Return 1" },
-  { name: "exec", desc: "Replace process" },
+  { name: "exec", desc: "Replace the process" },
   { name: "shift", desc: "Shift positional params" },
-  { name: "times", desc: "Process times" },
-  { name: "trap", desc: "Signal handler" },
+  { name: "times", desc: "Shell / user CPU times" },
+  { name: "trap", desc: "Signal handlers" },
   { name: "umask", desc: "File creation mask" },
-  { name: "break", desc: "Exit loop" },
+  { name: "break", desc: "Exit a loop" },
   { name: "continue", desc: "Next iteration" },
-  { name: "return", desc: "Return from function" },
+  { name: "return", desc: "Return from a function" },
   { name: "set", desc: "Shell options" },
-  { name: "setopt", desc: "Enable zsh-style option" },
-  { name: "unsetopt", desc: "Disable option" },
-  { name: "pushd", desc: "Push dir stack" },
-  { name: "popd", desc: "Pop dir stack" },
-  { name: "dirs", desc: "Show dir stack" },
-  { name: "type", desc: "Command type info" },
+  { name: "abbr", desc: "fish-style abbreviation", fishZsh: true },
+  { name: "pushd", desc: "Push onto the dir stack", fishZsh: true },
+  { name: "popd", desc: "Pop the dir stack", fishZsh: true },
+  { name: "dirs", desc: "Show the dir stack", fishZsh: true },
+  { name: "setopt", desc: "Enable a zsh option", fishZsh: true },
+  { name: "unsetopt", desc: "Disable a zsh option", fishZsh: true },
   { name: "help", desc: "Builtin help" },
 ];
 
-const COLORS = ["#7C3AED", "#A78BFA", "#F43F5E", "#00FF41"];
-
 export default function BuiltinsGrid() {
-  const isDesktop = useIsDesktop();
-
   return (
-    <section id="builtins" className="relative z-10 py-20 px-4 max-w-7xl mx-auto">
-      <div className="text-center mb-12">
-        <h2 className="font-display text-2xl md:text-4xl font-black tracking-[0.15em] uppercase text-glow mb-4">
-          /builtins
-        </h2>
-        <p className="font-mono text-sm text-[#A78BFA]/60 max-w-xl mx-auto">
-          38 built-in commands powering the shell experience
+    <section id="builtins" className="shell section">
+      <div className="mb-12 text-center">
+        <p className="kicker">/builtins</p>
+        <h2 className="section-title">38 builtins</h2>
+        <p className="section-sub">
+          Everything from <span className="text-[color:var(--accent)]">cd</span> to job control lives in
+          the shell itself — green cards are the fish &amp; zsh additions.
         </p>
       </div>
 
-      <div className={`grid gap-3 ${isDesktop ? "grid-cols-4 md:grid-cols-6" : "grid-cols-2"}`}>
-        {BUILTINS.map((cmd, i) => (
+      {/* flex-wrap so a short last row stays centered instead of hanging left */}
+      <div className="flex flex-wrap justify-center gap-3">
+        {BUILTINS.map((cmd) => (
           <GlitchCard
             key={cmd.name}
             title={cmd.name}
             subtitle={cmd.desc}
-            glowColor={COLORS[i % COLORS.length]}
+            glowColor={cmd.fishZsh ? "#4ADE80" : "#A78BFA"}
+            className="w-[calc(50%-0.375rem)] sm:w-[calc(33.333%-0.5rem)] lg:w-[9.75rem]"
           />
         ))}
       </div>

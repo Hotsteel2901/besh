@@ -41,58 +41,204 @@ static void lexer_skip_comment(Lexer *l) {
         l->pos++;
 }
 
-/* read a single-quoted string: '...' */
-static char *read_single_quoted(Lexer *l) {
-    int start = l->pos;  /* skip opening ' */
-    l->pos++;
-    while (l->pos < l->len && l->input[l->pos] != '\'') {
-        if (l->input[l->pos] == '\n') l->lineno++;
-        l->pos++;
-    }
-    int end = l->pos;
-    if (l->pos < l->len) l->pos++;  /* skip closing ' */
-    else {
-        fprintf(stderr, "besh: unterminated single-quoted string\n");
-    }
-    return sh_strndup(l->input + start + 1, end - start - 1);
+/* Characters that must be protected with a backslash in the token text so
+ * that a later stage (expand_string / brace / glob) treats them literally. */
+static int lex_protect(int c) {
+    return c == '$' || c == '`' || c == '"' || c == '\'' || c == '\\' ||
+           c == '~' || c == '*' || c == '?' || c == '[' || c == ']' ||
+           c == '{' || c == '}';
 }
 
-/* read a double-quoted string: " ... "  — handles \ escapes and $ expansion */
+/* variable-name characters following '$' */
+static int lex_name_start(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+static int lex_name_char(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+static void lex_grow(char **buf, int *cap, int need) {
+    if (need > *cap) {
+        while (*cap < need) *cap *= 2;
+        *buf = sh_realloc(*buf, *cap);
+    }
+}
+
+/* append one char verbatim */
+static void lex_append_raw(char **buf, int *len, int *cap, int c) {
+    lex_grow(buf, cap, *len + 2);
+    (*buf)[(*len)++] = (char)c;
+}
+
+/* append one char, escaping it if it is special to a later stage */
+static void lex_append(char **buf, int *len, int *cap, int c) {
+    int esc = lex_protect(c);
+    lex_grow(buf, cap, *len + (esc ? 3 : 2));
+    if (esc) (*buf)[(*len)++] = '\\';
+    (*buf)[(*len)++] = (char)c;
+}
+
+/* Emit `$name` as `${name}` and advance past the name.  This keeps a
+ * variable name from absorbing characters that live in a following,
+ * separate quoted segment — bash ends the name at the closing quote
+ * (e.g. 'a'"$a"'b' must yield axb, not a + $ab). */
+static void lex_emit_dollar_name(Lexer *l, char **buf, int *blen, int *bcap) {
+    int j = l->pos + 1;
+    while (j < l->len && lex_name_char((unsigned char)l->input[j])) j++;
+    lex_append_raw(buf, blen, bcap, '$');
+    lex_append_raw(buf, blen, bcap, '{');
+    for (int k = l->pos + 1; k < j; k++)
+        lex_append_raw(buf, blen, bcap, (unsigned char)l->input[k]);
+    lex_append_raw(buf, blen, bcap, '}');
+    l->pos = j;
+}
+
+/* Copy a whole `$(...)` / `$((...))` substitution verbatim and advance past
+ * it.  The text is re-parsed by command substitution later, so it must not
+ * be escape-mangled here (quotes and backslashes inside are meaningful). */
+static void lex_copy_dollar_paren(Lexer *l, char **buf, int *blen, int *bcap) {
+    int start = l->pos;
+    int i = l->pos + 2;              /* skip '$(' */
+    int depth = 1;
+    if (i < l->len && l->input[i] == '(') { i++; depth = 2; }  /* $(( */
+    while (i < l->len && depth > 0) {
+        char d = l->input[i];
+        if (d == '\\' && i + 1 < l->len) { i += 2; continue; }
+        if (d == '\'') {
+            i++;
+            while (i < l->len && l->input[i] != '\'') i++;
+            if (i < l->len) i++;
+            continue;
+        }
+        if (d == '"') {
+            i++;
+            while (i < l->len && l->input[i] != '"') {
+                if (l->input[i] == '\\' && i + 1 < l->len) i++;
+                i++;
+            }
+            if (i < l->len) i++;
+            continue;
+        }
+        if (d == '(') depth++;
+        else if (d == ')') { depth--; if (depth == 0) { i++; break; } }
+        i++;
+    }
+    for (int k = start; k < i; k++)
+        lex_append_raw(buf, blen, bcap, (unsigned char)l->input[k]);
+    l->pos = i;
+}
+
+/* read a single-quoted string: '...'
+ * Every character is literal, so each special character is backslash-
+ * protected in the returned text (quote semantics survive until expansion). */
+static char *read_single_quoted(Lexer *l) {
+    l->pos++;  /* skip opening ' */
+    int blen = 0, bcap = 64;
+    char *buf = sh_malloc(bcap);
+
+    while (l->pos < l->len && l->input[l->pos] != '\'') {
+        if (l->input[l->pos] == '\n') l->lineno++;
+        lex_append(&buf, &blen, &bcap, (unsigned char)l->input[l->pos]);
+        l->pos++;
+    }
+    if (l->pos < l->len) l->pos++;  /* skip closing ' */
+    else fprintf(stderr, "besh: unterminated single-quoted string\n");
+    buf[blen] = '\0';
+    return buf;
+}
+
+/* read a double-quoted string: " ... "
+ * `$` and backtick stay unescaped (expansion still happens), while the
+ * other special characters are backslash-protected so that they are not
+ * expanded, globbed or otherwise reinterpreted later. */
 static char *read_double_quoted(Lexer *l) {
     l->pos++;  /* skip opening " */
-    char *buf = sh_malloc(4096);
-    int blen = 0, bcap = 4096;
+    int blen = 0, bcap = 64;
+    int closed = 0;
+    int var_depth = 0;   /* nesting of $ { ... } */
+    int prev_dollar = 0;
+    char *buf = sh_malloc(bcap);
 
     while (l->pos < l->len) {
         char c = l->input[l->pos];
-        if (c == '"') {
-            l->pos++;
-            buf[blen] = '\0';
-            return buf;
-        }
+        if (c == '"') { l->pos++; closed = 1; break; }
         if (c == '\\') {
             l->pos++;
+            prev_dollar = 0;
             if (l->pos < l->len) {
                 char n = l->input[l->pos];
-                switch (n) {
-                case '"': case '\\': case '$': case '`':
-                    buf[blen++] = n; l->pos++; break;
-                case '\n':
-                    l->pos++; l->lineno++; break;  /* line continuation */
-                default:
-                    buf[blen++] = '\\'; break;
+                if (n == '$' || n == '`' || n == '"' || n == '\\') {
+                    lex_append(&buf, &blen, &bcap, (unsigned char)n);
+                    l->pos++;
+                } else if (n == '\n') {
+                    l->pos++; l->lineno++;  /* line continuation */
+                } else {
+                    /* backslash is literal here */
+                    lex_append(&buf, &blen, &bcap, '\\');
+                    lex_append(&buf, &blen, &bcap, (unsigned char)n);
+                    l->pos++;
                 }
+            } else {
+                lex_append(&buf, &blen, &bcap, '\\');
             }
             continue;
         }
         if (c == '\n') l->lineno++;
-        /* ensure capacity */
-        if (blen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
-        buf[blen++] = l->input[l->pos++];
+
+        /* $(...) / $((...)) must be copied verbatim (re-parsed later) */
+        if (c == '$' && l->pos + 1 < l->len && l->input[l->pos + 1] == '(') {
+            lex_copy_dollar_paren(l, &buf, &blen, &bcap);
+            prev_dollar = 0;
+            continue;
+        }
+        /* keep `$name` self-delimiting */
+        if (c == '$' && l->pos + 1 < l->len &&
+            lex_name_start((unsigned char)l->input[l->pos + 1])) {
+            lex_emit_dollar_name(l, &buf, &blen, &bcap);
+            prev_dollar = 0;
+            continue;
+        }
+        if (c == '$') {                     /* ${...}, $?, $(, ... */
+            lex_append_raw(&buf, &blen, &bcap, '$');
+            prev_dollar = 1;
+            l->pos++;
+            continue;
+        }
+        if (c == '`') {
+            lex_append_raw(&buf, &blen, &bcap, '`');
+            prev_dollar = 0;
+            l->pos++;
+            continue;
+        }
+        /* $* is a special parameter, not a glob */
+        if (prev_dollar && c == '*') {
+            lex_append_raw(&buf, &blen, &bcap, '*');
+            prev_dollar = 0;
+            l->pos++;
+            continue;
+        }
+        if (c == '{') {
+            if (prev_dollar) { lex_append_raw(&buf, &blen, &bcap, '{'); var_depth++; }
+            else             { lex_append(&buf, &blen, &bcap, '{'); }
+            prev_dollar = 0;
+            l->pos++;
+            continue;
+        }
+        if (c == '}') {
+            if (var_depth > 0) { lex_append_raw(&buf, &blen, &bcap, '}'); var_depth--; }
+            else               { lex_append(&buf, &blen, &bcap, '}'); }
+            prev_dollar = 0;
+            l->pos++;
+            continue;
+        }
+        lex_append(&buf, &blen, &bcap, (unsigned char)c);
+        prev_dollar = 0;
+        l->pos++;
     }
-    /* unterminated */
     buf[blen] = '\0';
-    fprintf(stderr, "besh: unterminated double-quoted string\n");
+    if (!closed)
+        fprintf(stderr, "besh: unterminated double-quoted string\n");
     return buf;
 }
 
@@ -111,24 +257,7 @@ static char *read_word(Lexer *l) {
         /* handle $(...) and $((...)) before the special-char check,
          * since '(' would otherwise split the word */
         if (c == '$' && l->pos + 1 < l->len && l->input[l->pos + 1] == '(') {
-            int start = l->pos;
-            l->pos += 2;                       /* skip '$(' */
-            int depth = 1;
-            /* detect arithmetic form $(( ... )) */
-            if (l->pos < l->len && l->input[l->pos] == '(') {
-                l->pos++;
-                depth = 2;
-            }
-            while (l->pos < l->len && depth > 0) {
-                if (l->input[l->pos] == '(') depth++;
-                else if (l->input[l->pos] == ')') depth--;
-                if (depth > 0) l->pos++;
-            }
-            if (l->pos < l->len) l->pos++;    /* skip final ')' */
-            int sublen = l->pos - start;
-            while (blen + sublen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
-            memcpy(buf + blen, l->input + start, sublen);
-            blen += sublen;
+            lex_copy_dollar_paren(l, &buf, &blen, &bcap);
             continue;
         }
 
@@ -152,7 +281,8 @@ static char *read_word(Lexer *l) {
         /* special characters end word (but are returned separately) */
         if (sh_is_special_char(c) && !(c == '\n' || c == '\0')) break;
 
-        /* handle backslash escape */
+        /* handle backslash escape: the escaped char is literal, so protect
+         * it in the token text if a later stage would treat it specially */
         if (c == '\\') {
             l->pos++;
             if (l->pos < l->len) {
@@ -160,9 +290,10 @@ static char *read_word(Lexer *l) {
                 if (n == '\n') {
                     l->pos++; l->lineno++; continue;  /* line continuation */
                 }
-                /* special chars lose their meaning after \ */
-                if (blen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
-                buf[blen++] = n;
+                if (lex_protect((unsigned char)n))
+                    lex_append(&buf, &blen, &bcap, (unsigned char)n);
+                else
+                    lex_append_raw(&buf, &blen, &bcap, (unsigned char)n);
                 l->pos++;
             }
             continue;
@@ -172,19 +303,28 @@ static char *read_word(Lexer *l) {
         if (c == '\'') {
             char *inner = read_single_quoted(l);
             int ilen = strlen(inner);
-            while (blen + ilen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
+            lex_grow(&buf, &bcap, blen + ilen + 1);
             memcpy(buf + blen, inner, ilen);
             blen += ilen;
             free(inner);
+            l->token_quoted = 1;
             continue;
         }
         if (c == '"') {
             char *inner = read_double_quoted(l);
             int ilen = strlen(inner);
-            while (blen + ilen + 2 >= bcap) { bcap *= 2; buf = sh_realloc(buf, bcap); }
+            lex_grow(&buf, &bcap, blen + ilen + 1);
             memcpy(buf + blen, inner, ilen);
             blen += ilen;
             free(inner);
+            l->token_quoted = 1;
+            continue;
+        }
+
+        /* keep `$name` self-delimiting (see lex_emit_dollar_name) */
+        if (c == '$' && l->pos + 1 < l->len &&
+            lex_name_start((unsigned char)l->input[l->pos + 1])) {
+            lex_emit_dollar_name(l, &buf, &blen, &bcap);
             continue;
         }
 
@@ -426,23 +566,8 @@ int lexer_next(Lexer *l) {
         return TOK_RPAREN;
     }
 
-    /* single-quoted string (as a standalone token) */
-    if (c == '\'') {
-        l->token_text = read_single_quoted(l);
-        l->token_type = TOK_WORD;
-        l->token_quoted = 1;
-        return TOK_WORD;
-    }
-
-    /* double-quoted string (as a standalone token) */
-    if (c == '"') {
-        l->token_text = read_double_quoted(l);
-        l->token_type = TOK_WORD;
-        l->token_quoted = 1;
-        return TOK_WORD;
-    }
-
-    /* word token — read_word handles backticks and $(...) internally */
+    /* word token — read_word handles quotes, backticks and $(...)
+     * internally, and merges adjacent quoted segments ("a"'b' → ab) */
     l->token_text = read_word(l);
     l->token_type = TOK_WORD;
     return TOK_WORD;

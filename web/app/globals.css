@@ -1,36 +1,61 @@
+/* Fonts must be imported before any other rule, otherwise the browser drops
+ * the @import entirely and the whole site falls back to system fonts. */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Orbitron:wght@600;700;800;900&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-*,
-*::before,
-*::after {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
-}
-
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Orbitron:wght@700;900&display=swap');
-
 :root {
-  --neon-purple: #7C3AED;
-  --accent-rose: #F43F5E;
-  --void-bg: #0F0F23;
-  --terminal-green: #00FF41;
-  --dark-panel: #1A1030;
+  --void-bg: #0f0f23;
+  --panel: #161033;
+  --panel-2: #1a1030;
+  --line: rgba(124, 58, 237, 0.35);
+
+  --accent: #a78bfa;        /* purple, readable on dark (6.9:1) */
+  --accent-bright: #c4b5fd;
+  --accent-strong: #8b5cf6; /* borders and glows */
+  --green: #4ade80;         /* readable green for text */
+  --green-bright: #00ff41;  /* terminal accents */
+  --rose: #fb7185;
+  --amber: #fbbf24;
+
+  --text-1: #e8eaf6;        /* body copy (15:1) */
+  --text-2: #b9b3de;        /* secondary copy (8:1) */
+  --text-3: #918cb8;        /* captions and labels (5.5:1) */
 }
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--neon-purple) var(--void-bg);
+  scrollbar-color: var(--accent-strong) var(--void-bg);
+}
+
+html {
+  scroll-behavior: smooth;
 }
 
 body {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
   background: var(--void-bg);
-  color: #E2E8F0;
+  color: var(--text-1);
   overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
 }
+
+::selection {
+  background: rgba(139, 92, 246, 0.35);
+  color: #fff;
+}
+
+/* Visible focus ring everywhere — the default outline is invisible on this
+ * dark surface, which made the whole page unusable by keyboard. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* ---- decorative layers ------------------------------------------ */
 
 .crt-overlay::before {
   content: "";
@@ -41,36 +66,98 @@ body {
   height: 100%;
   background: repeating-linear-gradient(
     0deg,
-    rgba(0, 0, 0, 0.08) 0px,
-    rgba(0, 0, 0, 0.08) 2px,
-    transparent 2px,
-    transparent 4px
+    rgba(0, 0, 0, 0.16) 0px,
+    rgba(0, 0, 0, 0.16) 1px,
+    transparent 1px,
+    transparent 3px
   );
+  opacity: 0.35;
   pointer-events: none;
-  z-index: 9999;
-  animation: scanline 8s linear infinite;
 }
 
+/* Glow is reserved for display type only, and kept soft so glyph edges
+ * stay crisp. */
 .neon-glow {
-  text-shadow: 0 0 5px var(--neon-purple), 0 0 20px var(--neon-purple), 0 0 40px var(--neon-purple);
+  text-shadow: 0 0 12px rgba(139, 92, 246, 0.55), 0 0 40px rgba(139, 92, 246, 0.25);
 }
 
 .neon-glow-green {
-  text-shadow: 0 0 5px var(--terminal-green), 0 0 20px var(--terminal-green);
+  text-shadow: 0 0 10px rgba(0, 255, 65, 0.35);
 }
 
 .neon-border {
-  border: 1px solid var(--neon-purple);
-  box-shadow: 0 0 5px var(--neon-purple), 0 0 20px var(--neon-purple), inset 0 0 5px rgba(124, 58, 237, 0.2);
+  border: 1px solid var(--line);
+  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.08), 0 18px 50px -30px rgba(139, 92, 246, 0.5);
+}
+
+@layer components {
+  /* One container width and rhythm for every section. */
+  .shell {
+    @apply relative z-10 mx-auto w-full max-w-6xl px-5 sm:px-6;
+  }
+
+  .section {
+    @apply py-16 md:py-24;
+  }
+
+  .kicker {
+    @apply mb-3 font-mono text-[11px] uppercase tracking-[0.35em] text-[color:var(--green)];
+  }
+
+  .section-title {
+    @apply font-display text-3xl font-black uppercase tracking-[0.12em] text-[color:var(--text-1)] md:text-5xl;
+  }
+
+  .section-sub {
+    @apply mx-auto mt-4 max-w-2xl font-mono text-sm leading-relaxed text-[color:var(--text-2)];
+  }
+
+  .panel {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: linear-gradient(150deg, rgba(26, 16, 48, 0.85), rgba(15, 15, 35, 0.92));
+  }
+
+  .chip {
+    @apply inline-flex items-center rounded border px-2.5 py-1 font-mono text-xs;
+    border-color: rgba(139, 92, 246, 0.35);
+    background: rgba(139, 92, 246, 0.08);
+    color: var(--text-2);
+  }
+
+  .btn {
+    @apply inline-flex min-h-[40px] items-center justify-center gap-2 rounded border px-4 font-mono text-sm transition-colors;
+    border-color: var(--line);
+    color: var(--text-1);
+  }
+
+  .btn:hover {
+    border-color: rgba(167, 139, 250, 0.7);
+    background: rgba(139, 92, 246, 0.12);
+  }
+
+  .btn-primary {
+    border-color: rgba(74, 222, 128, 0.5);
+    background: rgba(74, 222, 128, 0.1);
+    color: var(--green);
+  }
+
+  .btn-primary:hover {
+    border-color: rgba(74, 222, 128, 0.9);
+    background: rgba(74, 222, 128, 0.18);
+  }
 }
 
 @layer utilities {
   .text-glow {
-    text-shadow: 0 0 7px var(--neon-purple), 0 0 20px var(--neon-purple);
+    text-shadow: 0 0 12px rgba(139, 92, 246, 0.5), 0 0 36px rgba(139, 92, 246, 0.22);
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;

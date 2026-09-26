@@ -2,17 +2,26 @@
 import { useRef, useEffect, useState, useCallback } from "react";
 import { useIsDesktop } from "@/app/hooks/useIsDesktop";
 import { useReducedMotion } from "@/app/hooks/useReducedMotion";
+import { useInViewport } from "@/app/hooks/useInViewport";
+import { useGameActivation } from "@/app/hooks/useGameActivation";
+import GameDesktopCard from "@/app/components/GameDesktopCard";
+import GameHeader from "@/app/components/GameHeader";
 
 const COMMANDS = "echo cd pwd ls cat export unset alias source exit jobs fg bg history read test help".split(" ");
+const PAC_KEYS = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"] as const;
 
 interface Ghost { x: number; y: number; dx: number; dy: number; color: string; }
 
 export default function PacEat() {
   const isDesktop = useIsDesktop();
   const reduced = useReducedMotion();
+  const { ref: sectionRef, inView } = useInViewport<HTMLElement>();
+  const { active, activate, deactivate, handleBlur, containerRef, pressedRef } = useGameActivation(PAC_KEYS);
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [score, setScore] = useState(0);
   const [gameOver, setGameOver] = useState(false);
+  const [paused, setPaused] = useState(false);
   const pacmanRef = useRef({ x: 200, y: 200, dir: 1, mouth: 0 });
   const foodsRef = useRef<{ x: number; y: number; cmd: string }[]>([]);
   const ghostsRef = useRef<Ghost[]>([]);
@@ -35,34 +44,63 @@ export default function PacEat() {
 
   useEffect(() => { reset(); }, [reset]);
 
+  // Release the keyboard as soon as a round ends.
   useEffect(() => {
-    if (!isDesktop || reduced || gameOver) return;
+    if (gameOver) deactivate();
+  }, [gameOver, deactivate]);
+
+  const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const W = 400, H = 300;
+    const W = canvas.width, H = canvas.height;
+    const p = pacmanRef.current;
 
-    const keys: Record<string, boolean> = {};
-    const onKey = (e: KeyboardEvent) => { keys[e.key] = true; e.preventDefault(); };
-    const offKey = (e: KeyboardEvent) => { keys[e.key] = false; };
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("keyup", offKey);
+    ctx.fillStyle = "#0F0F23"; ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = "#4C1D95"; ctx.strokeRect(0, 0, W, H);
+    foodsRef.current.forEach((f) => {
+      ctx.fillStyle = "#00FF41"; ctx.beginPath();
+      ctx.arc(f.x, f.y, 6, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#A78BFA"; ctx.font = "12px monospace"; ctx.textAlign = "center";
+      ctx.fillText(f.cmd, f.x, f.y - 12);
+    });
+    ctx.textAlign = "left";
+    ghostsRef.current.forEach((g) => {
+      ctx.fillStyle = g.color; ctx.beginPath();
+      ctx.arc(g.x, g.y, 12, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#FFF";
+      ctx.beginPath(); ctx.arc(g.x - 4, g.y - 3, 3, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(g.x + 4, g.y - 3, 3, 0, Math.PI * 2); ctx.fill();
+    });
+    ctx.fillStyle = "#FBBF24"; ctx.beginPath();
+    const angle = p.mouth * 0.5;
+    ctx.arc(p.x, p.y, 14, p.dir > 0 ? angle : Math.PI + angle, p.dir > 0 ? Math.PI * 2 - angle : Math.PI - angle);
+    ctx.lineTo(p.x, p.y); ctx.fill();
+  }, []);
+
+  const running = isDesktop && !reduced && !gameOver && active && !paused && inView;
+
+  useEffect(() => {
+    if (!running) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
     const loop = () => {
       const p = pacmanRef.current;
+      const keys = pressedRef.current;
       if (keys["ArrowLeft"]) { p.x -= 3; p.dir = -1; }
       if (keys["ArrowRight"]) { p.x += 3; p.dir = 1; }
       if (keys["ArrowUp"]) p.y -= 3;
       if (keys["ArrowDown"]) p.y += 3;
-      p.x = Math.max(15, Math.min(W - 15, p.x));
-      p.y = Math.max(15, Math.min(H - 15, p.y));
+      p.x = Math.max(15, Math.min(canvas.width - 15, p.x));
+      p.y = Math.max(15, Math.min(canvas.height - 15, p.y));
       p.mouth = (p.mouth + 0.15) % 1;
 
       ghostsRef.current.forEach((g) => {
         g.x += g.dx; g.y += g.dy;
-        if (g.x < 15 || g.x > W - 15) g.dx *= -1;
-        if (g.y < 15 || g.y > H - 15) g.dy *= -1;
+        if (g.x < 15 || g.x > canvas.width - 15) g.dx *= -1;
+        if (g.y < 15 || g.y > canvas.height - 15) g.dy *= -1;
       });
 
       foodsRef.current = foodsRef.current.filter((f) => {
@@ -70,59 +108,121 @@ export default function PacEat() {
         return true;
       });
 
+      let over = foodsRef.current.length === 0;
       for (const g of ghostsRef.current) {
-        if (Math.hypot(p.x - g.x, p.y - g.y) < 20) { setGameOver(true); return; }
+        if (Math.hypot(p.x - g.x, p.y - g.y) < 20) { over = true; break; }
       }
-      if (foodsRef.current.length === 0) { setGameOver(true); return; }
+      if (over) { setGameOver(true); draw(); return; }
 
-      ctx.fillStyle = "#0F0F23"; ctx.fillRect(0, 0, W, H);
-      ctx.strokeStyle = "#4C1D95"; ctx.strokeRect(0, 0, W, H);
-      foodsRef.current.forEach((f) => {
-        ctx.fillStyle = "#00FF41"; ctx.beginPath();
-        ctx.arc(f.x, f.y, 6, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = "#A78BFA"; ctx.font = "8px monospace";
-        ctx.fillText(f.cmd, f.x - 12, f.y - 10);
-      });
-      ghostsRef.current.forEach((g) => {
-        ctx.fillStyle = g.color; ctx.beginPath();
-        ctx.arc(g.x, g.y, 12, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = "#FFF";
-        ctx.beginPath(); ctx.arc(g.x - 4, g.y - 3, 3, 0, Math.PI * 2); ctx.fill();
-        ctx.beginPath(); ctx.arc(g.x + 4, g.y - 3, 3, 0, Math.PI * 2); ctx.fill();
-      });
-      ctx.fillStyle = "#FBBF24"; ctx.beginPath();
-      const angle = p.mouth * 0.5;
-      ctx.arc(p.x, p.y, 14, p.dir > 0 ? angle : Math.PI + angle, p.dir > 0 ? Math.PI * 2 - angle : Math.PI - angle);
-      ctx.lineTo(p.x, p.y); ctx.fill();
+      draw();
       animRef.current = requestAnimationFrame(loop);
     };
     animRef.current = requestAnimationFrame(loop);
-    return () => { cancelAnimationFrame(animRef.current); window.removeEventListener("keydown", onKey); window.removeEventListener("keyup", offKey); };
-  }, [isDesktop, reduced, gameOver]);
+    return () => cancelAnimationFrame(animRef.current);
+  }, [running, draw, pressedRef]);
+
+  // Repaint a single static frame whenever the loop is not running
+  // (idle / paused / offscreen) so the board always reflects reality.
+  useEffect(() => {
+    if (!running) draw();
+  }, [running, draw, score, paused, active]);
+
+  const handleRestart = useCallback(() => {
+    reset();
+    setPaused(false);
+    if (!active) activate();
+  }, [reset, active, activate]);
+
+  const handleContainerKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (active) return;
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        activate();
+      }
+    },
+    [active, activate]
+  );
 
   if (!isDesktop) return (
-    <section className="relative z-10 py-20 px-4 max-w-4xl mx-auto text-center">
-      <h2 className="font-display text-2xl md:text-4xl font-black tracking-[0.15em] uppercase text-glow mb-4">/pac-eat</h2>
-      <p className="font-mono text-sm text-[#A78BFA]/60">Open on desktop to play Pac-Eat: commands edition</p>
-    </section>
+    <div ref={sectionRef} className="scroll-mt-24">
+      <GameHeader name="pac-eat" note="Eat the commands, dodge the ghosts." />
+      <GameDesktopCard
+        tagline="Move with the arrow keys and eat every command before a ghost catches you."
+        bullets={
+          <>
+            <li>↑ ↓ ← → to move Pac-Man</li>
+            <li>Esc releases the keyboard · losing focus pauses the game</li>
+          </>
+        }
+      />
+    </div>
   );
 
   return (
-    <section className="relative z-10 py-20 px-4 max-w-4xl mx-auto">
-      <div className="text-center mb-8">
-        <h2 className="font-display text-2xl md:text-4xl font-black tracking-[0.15em] uppercase text-glow mb-4">/pac-eat</h2>
-        <p className="font-mono text-sm text-[#A78BFA]/60 mb-2">Eat the commands! Avoid the ghosts! Arrow keys to move.</p>
-        <p className="font-mono text-lg text-[#00FF41]">Score: {score}</p>
-      </div>
-      <div className="flex justify-center">
-        <canvas ref={canvasRef} width={400} height={300} className="neon-border rounded-sm" />
+    <div ref={sectionRef} className="scroll-mt-24">
+      <GameHeader name="pac-eat" note="Eat the commands, dodge the ghosts." />
+      <div className="flex flex-col items-center">
+        <p className="mb-3 font-mono text-sm text-[color:var(--text-2)]">
+          Score: <span className="text-[color:var(--green)]">{score}</span>
+        </p>
+        <div
+          ref={containerRef}
+          role="button"
+          tabIndex={0}
+          aria-label="Pac-Eat game area. Activate to play with the arrow keys."
+          onClick={() => { if (!active && !gameOver) activate(); }}
+          onKeyDown={handleContainerKeyDown}
+          onBlur={handleBlur}
+          className="relative inline-block rounded-sm outline-none cursor-pointer"
+          style={{
+            boxShadow: active
+              ? "0 0 0 2px #7C3AED, 0 0 18px rgba(124,58,237,0.7)"
+              : "0 0 0 1px #4C1D95",
+          }}
+        >
+          <canvas ref={canvasRef} width={400} height={300} className="neon-border rounded-sm block" />
+          {(!active || paused) && !gameOver && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#0F0F23]/75 rounded-sm pointer-events-none">
+              <p className="font-display text-lg font-black tracking-[0.2em] uppercase text-[#FBBF24]" style={{ textShadow: "0 0 8px #7C3AED" }}>
+                {active ? "Paused" : "Click to play"}
+              </p>
+              <p className="font-mono text-xs text-[color:var(--text-2)] mt-2">
+                {active ? "Press [resume] or Esc" : "Arrow keys to move · Esc to release"}
+              </p>
+            </div>
+          )}
+          <div className="flex justify-center gap-3 mt-4">
+            <button
+              type="button"
+              onClick={() => setPaused((p) => !p)}
+              disabled={!active || gameOver}
+              className="px-4 py-2 font-mono text-sm text-[#00FF41] border border-[#00FF41] rounded hover:bg-[#00FF41]/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {paused ? "[resume]" : "[pause]"}
+            </button>
+            <button
+              type="button"
+              onClick={handleRestart}
+              className="px-4 py-2 font-mono text-sm text-[#A78BFA] border border-[#4C1D95] rounded hover:bg-[#4C1D95]/20 transition-colors"
+            >
+              [restart]
+            </button>
+          </div>
+        </div>
+        <p className="font-mono text-xs mt-3 h-4">
+          {active && !gameOver ? (
+            <span className="text-[#00FF41]">Playing — Esc to release · blur pauses</span>
+          ) : (
+            <span className="text-[color:var(--text-3)]">Click the screen (or press Enter) to activate · keys are captured only while playing</span>
+          )}
+        </p>
       </div>
       {gameOver && (
         <div className="text-center mt-4">
           <p className="font-mono text-xl text-[#F43F5E] mb-2">{foodsRef.current.length === 0 ? "YOU WIN!" : "GAME OVER"}</p>
-          <button onClick={reset} className="px-4 py-2 font-mono text-sm text-[#00FF41] border border-[#00FF41] rounded hover:bg-[#00FF41]/10 transition-colors">[restart]</button>
         </div>
       )}
-    </section>
+    </div>
   );
 }

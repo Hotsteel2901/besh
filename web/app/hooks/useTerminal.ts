@@ -3,15 +3,30 @@ import { useState, useCallback } from "react";
 
 const BANNER = "besh v1.1.0 — a bash-compatible shell in C, remixed with fish & zsh";
 
+/* A short, honest demo session so the terminal isn't an empty box on load. */
+const DEMO_TRANSCRIPT = [
+  BANNER,
+  "",
+  '$ abbr -a gp "git push"',
+  "$ gp",
+  "git push — expanded from abbr 'gp' ✓",
+  "$ echo {1..5}",
+  "1 2 3 4 5",
+  "$ echo **/*.c",
+  "main.c  lexer.c  parser.c  executor.c  builtins.c  expand.c",
+  "",
+];
+
 const COMMANDS: Record<string, string[]> = {
   help: [
-    "besh commands:",
-    "  cd  echo  pwd  ls  cat  export  unset  alias  abbr  source  exit",
-    "  jobs  fg  bg  history  set  setopt  read  test  shift  type",
-    "  pushd  popd  dirs  readonly  wait  help",
+    "besh built-in commands:",
+    "  abbr  alias  bg  break  cd  continue  dirs  echo  exec  exit",
+    "  export  false  fg  help  history  jobs  popd  pushd  pwd  read",
+    "  readonly  return  set  setopt  shift  source  test  times  trap",
+    "  true  type  umask  unalias  unset  unsetopt  wait  [  .",
     "",
     "fish/zsh features to try:",
-    "  abbr -a gp \"git push\"    gp      # abbreviation expansion",
+    '  abbr -a gp "git push"    gp      # abbreviation expansion',
     "  echo {1..5}              echo **/*.c",
     "  pushd /var/log           dirs -v  popd",
     "  setopt                    unsetopt autocd",
@@ -63,7 +78,7 @@ const COMMANDS: Record<string, string[]> = {
 };
 
 export function useTerminal() {
-  const [history, setHistory] = useState<string[]>([BANNER, ""]);
+  const [history, setHistory] = useState<string[]>(DEMO_TRANSCRIPT);
 
   const pushLine = useCallback((input: string) => {
     setHistory((prev) => {

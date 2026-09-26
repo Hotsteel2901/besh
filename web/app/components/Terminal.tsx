@@ -1,39 +1,31 @@
 "use client";
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useTerminal } from "@/app/hooks/useTerminal";
-import { useIsDesktop } from "@/app/hooks/useIsDesktop";
 
+/* Every builtin name registered in builtins.c — used to color the first word
+ * green (valid) or rose (unknown), fish-style. */
 const KNOWN_COMMANDS = new Set([
-  "echo", "cd", "pwd", "ls", "cat", "export", "unset", "alias", "unalias",
-  "abbr", "source", "exit", "jobs", "fg", "bg", "wait", "history", "read",
-  "test", "true", "false", "exec", "shift", "times", "trap", "umask",
-  "break", "continue", "return", "set", "setopt", "unsetopt", "pushd",
-  "popd", "dirs", "type", "help", "neofetch", "whoami", "uname", "uptime", "date",
+  "abbr", "alias", "bg", "break", "cd", "continue", "dirs", "echo", "exec",
+  "exit", "export", "false", "fg", "help", "history", "jobs", "popd", "pushd",
+  "pwd", "read", "readonly", "return", "set", "setopt", "shift", "source",
+  "test", "times", "trap", "true", "type", "umask", "unalias", "unset",
+  "unsetopt", "wait", "[", ".", "clear", "ls", "cat", "neofetch", "whoami",
+  "uname", "uptime", "date", "gp",
 ]);
 
-const DEMO_COMMANDS = [
-  "abbr -a gp \"git push\"",
-  "gp",
-  "echo {1..5}",
-  "echo **/*.c",
-  "pushd /var/log",
-  "dirs -v",
-  "setopt",
-  "neofetch",
-  "help",
-];
+const QUICK_COMMANDS = ["help", "neofetch", "gp", "echo {1..5}", "dirs -v"];
 
 /* Fish-style syntax highlighting for a `cmd arg...` line */
 function Highlighted({ text }: { text: string }) {
   const parts = text.split(" ");
   const cmd = parts[0].toLowerCase();
-  const cmdColor = KNOWN_COMMANDS.has(cmd) ? "#00FF41" : "#F43F5E";
+  const cmdColor = KNOWN_COMMANDS.has(cmd) ? "#4ADE80" : "#FB7185";
 
   return (
     <>
       <span style={{ color: cmdColor }}>{parts[0]}</span>
       {parts.slice(1).map((arg, i) => {
-        let color = "#E2E8F0";
+        let color = "#E8EAF6";
         if (arg.startsWith("-")) color = "#FBBF24";
         else if (arg.startsWith("$") || arg.startsWith("$(")) color = "#22D3EE";
         else if (/^\d+$/.test(arg)) color = "#F472B6";
@@ -54,8 +46,7 @@ export default function Terminal() {
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const isDesktop = useIsDesktop();
-  const [executed, setExecuted] = useState<string[]>(DEMO_COMMANDS);
+  const [executed, setExecuted] = useState<string[]>([]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -91,100 +82,132 @@ export default function Terminal() {
     [input, pushLine, clear]
   );
 
-  const quickCommands = ["help", "neofetch", "gp", "echo {1..5}", "dirs -v"];
-
   return (
-    <div className="w-full max-w-3xl mx-auto">
-      <div className="neon-border rounded-sm overflow-hidden">
-        {/* Title bar */}
-        <div className="flex items-center justify-between px-4 py-2 bg-[#1A1030] border-b border-[#4C1D95]">
-          <span className="text-xs text-[#00FF41] font-mono tracking-wider">
-            ┌─ besh@cybershell ───────
-          </span>
-          <div className="flex gap-2">
-            <span className="w-3 h-3 rounded-full bg-[#F43F5E]" />
-            <span className="w-3 h-3 rounded-full bg-[#FBBF24]" />
-            <span className="w-3 h-3 rounded-full bg-[#00FF41]" />
-          </div>
-        </div>
+    <section id="terminal" className="shell section">
+      <div className="mb-10 text-center">
+        <p className="kicker">/demo</p>
+        <h2 className="section-title">Terminal</h2>
+        <p className="section-sub">
+          A browser mock of the real prompt — fish-style autosuggestions, syntax highlighting
+          and a few commands to poke at. Press <span className="text-[color:var(--green)]">→</span> to
+          accept the gray suggestion.
+        </p>
+      </div>
 
-        {/* Terminal output */}
-        <div
-          ref={scrollRef}
-          className="h-64 md:h-80 overflow-y-auto px-4 py-3 font-mono text-sm leading-relaxed"
-          style={{ background: "rgba(15,15,35,0.95)" }}
-        >
-          {history.map((line, i) => (
-            <div
-              key={i}
-              className={
-                line.startsWith("$ ")
-                  ? ""
-                  : line === ""
-                    ? "h-2"
-                    : "text-[#00FF41]/80"
-              }
-            >
-              {line.startsWith("$ ") ? (
-                <>
-                  <span className="text-[#7C3AED]">$ </span>
-                  <Highlighted text={line.slice(2)} />
-                </>
-              ) : line ? (
-                line
-              ) : (
-                "\u00A0"
-              )}
+      <div className="mx-auto w-full max-w-3xl">
+        <div className="neon-border overflow-hidden rounded-md">
+          {/* Title bar */}
+          <div className="flex items-center gap-3 border-b border-[color:var(--line)] bg-[#1a1030] px-4 py-2.5">
+            <div className="flex gap-2">
+              <span className="h-3 w-3 rounded-full bg-[#F43F5E]" />
+              <span className="h-3 w-3 rounded-full bg-[#FBBF24]" />
+              <span className="h-3 w-3 rounded-full bg-[#4ADE80]" />
             </div>
-          ))}
-        </div>
-
-        {/* Input area */}
-        <form
-          onSubmit={handleSubmit}
-          className="flex items-center px-4 py-2 bg-[#0F0F23] border-t border-[#4C1D95]"
-        >
-          <span className="text-[#7C3AED] font-mono text-sm mr-2">$</span>
-          <div className="flex-1 relative font-mono text-sm">
-            <Highlighted text={input} />
-            {suggestion && (
-              <span className="text-[#6B21A8]">{suggestion}</span>
-            )}
-            <input
-              ref={inputRef}
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              className="absolute inset-0 bg-transparent border-none outline-none text-transparent caret-[#00FF41] font-mono text-sm w-full"
-              placeholder={suggestion ? "" : "type a command... (→ accepts suggestions)"}
-              autoFocus
-              spellCheck={false}
-              onKeyDown={(e) => {
-                if (e.key === "ArrowRight" && suggestion) {
-                  e.preventDefault();
-                  setInput((prev) => prev + suggestion);
-                }
-              }}
-            />
+            <span className="font-mono text-xs text-[color:var(--text-2)]">
+              besh — zsh-style prompt
+            </span>
+            <span className="ml-auto font-mono text-[11px] text-[color:var(--text-3)]">v1.1.0</span>
           </div>
-        </form>
 
-        {/* Quick command buttons (mobile only) */}
-        {!isDesktop && (
-          <div className="flex flex-wrap gap-1 px-4 py-2 bg-[#0F0F23] border-t border-[#4C1D95]">
-            {quickCommands.map((cmd) => (
+          {/* Terminal output */}
+          <div
+            ref={scrollRef}
+            className="h-72 overflow-y-auto px-4 py-3 font-mono text-[13px] leading-relaxed md:h-80"
+            style={{ background: "rgba(15,15,35,0.95)" }}
+          >
+            {history.map((line, i) => (
+              <div
+                key={i}
+                className={
+                  line.startsWith("$ ")
+                    ? ""
+                    : line === ""
+                      ? "h-3"
+                      : "text-[#4ADE80]/85"
+                }
+              >
+                {line.startsWith("$ ") ? (
+                  <>
+                    <span className="text-[color:var(--accent)]">$ </span>
+                    <Highlighted text={line.slice(2)} />
+                  </>
+                ) : line ? (
+                  line
+                ) : (
+                  "\u00A0"
+                )}
+              </div>
+            ))}
+          </div>
+
+          {/* Input area — clicking anywhere on the row focuses the field */}
+          <form
+            onSubmit={handleSubmit}
+            onClick={() => inputRef.current?.focus()}
+            className="flex cursor-text items-start gap-2 border-t border-[color:var(--line)] bg-[#0f0f23] px-4 py-3"
+          >
+            <span className="font-mono text-sm leading-6 text-[color:var(--accent)]">$</span>
+            <div className="relative min-h-[1.5rem] min-w-0 flex-1 font-mono text-sm leading-6">
+              {/* Mirror layer: keeps the row tall and shows live highlighting */}
+              <span aria-hidden className="pointer-events-none block whitespace-pre-wrap break-words">
+                {input ? (
+                  <>
+                    <Highlighted text={input} />
+                    {suggestion && <span className="text-[color:var(--text-3)]">{suggestion}</span>}
+                  </>
+                ) : (
+                  <span className="text-[color:var(--text-3)]">
+                    type a command… (→ accepts suggestions)
+                  </span>
+                )}
+              </span>
+              <input
+                ref={inputRef}
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                aria-label="Terminal input"
+                className="absolute inset-0 h-full w-full border-none bg-transparent font-mono text-sm text-transparent caret-[#00FF41] outline-none"
+                spellCheck={false}
+                onKeyDown={(e) => {
+                  if (e.key === "ArrowRight" && suggestion) {
+                    e.preventDefault();
+                    setInput((prev) => prev + suggestion);
+                  }
+                }}
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => inputRef.current?.focus()}
+              className="hidden shrink-0 self-center font-mono text-[11px] text-[color:var(--text-3)] transition-colors hover:text-[color:var(--green)] sm:block"
+            >
+              click to type
+            </button>
+          </form>
+
+          {/* Quick command chips — available on every viewport, ≥34px tall */}
+          <div className="flex flex-wrap items-center gap-2 border-t border-[color:var(--line)] bg-[#0f0f23] px-4 py-3">
+            <span className="font-mono text-[11px] uppercase tracking-widest text-[color:var(--text-3)]">
+              try
+            </span>
+            {QUICK_COMMANDS.map((cmd) => (
               <button
                 key={cmd}
                 type="button"
-                onClick={() => pushLine(cmd)}
-                className="px-2 py-1 text-xs font-mono text-[#A78BFA] border border-[#4C1D95] rounded hover:bg-[#4C1D95]/20 transition-colors"
+                onClick={() => {
+                  pushLine(cmd);
+                  setExecuted((prev) => [...prev, cmd]);
+                  inputRef.current?.focus();
+                }}
+                className="btn min-h-[34px] px-2.5 text-xs"
               >
                 {cmd}
               </button>
             ))}
           </div>
-        )}
+        </div>
       </div>
-    </div>
+    </section>
   );
 }

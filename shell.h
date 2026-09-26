@@ -374,6 +374,8 @@ int  abbr_erase(const char *name);
  * ------------------------------------------------------------------- */
 char  *expand_string(const char *str);
 char **expand_words(char **words, int *count);
+char  *unescape_word(const char *str);
+char  *unescape_token(const char *str);
 char  *tilde_expand(const char *str);
 char **glob_expand(const char *pattern, int *count);
 char **brace_expand(const char *str, int *count);

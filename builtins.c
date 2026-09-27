@@ -131,7 +131,7 @@ int builtin_echo(int argc, char **argv) {
                     switch (*p) {
                     case 'a': putchar('\a'); break;
                     case 'b': putchar('\b'); break;
-                    case 'c': return 0;        /* stop output */
+                    case 'c': goto echo_done;  /* stop output, still flush */
                     case 'e': case 'E': putchar('\x1b'); break;
                     case 'f': putchar('\f'); break;
                     case 'n': putchar('\n'); break;
@@ -174,6 +174,11 @@ int builtin_echo(int argc, char **argv) {
         }
     }
     if (newline) putchar('\n');
+echo_done:
+    /* `\c` stops output early, but everything already written must still
+     * reach the terminal/file.  Without this flush the bytes sit in stdio's
+     * buffer, and because echo is a builtin (no exit to flush for it) the
+     * file is still empty when the next command runs. */
     fflush(stdout);
     return 0;
 }
@@ -1913,12 +1918,16 @@ int builtin_set(int argc, char **argv) {
     return 0;
 }
 
+#include <sys/select.h>
+
 /* ================================================================
- *  read [-p prompt] [-r] var...  — read a line, split on IFS
+ *  read [-p prompt] [-r] [-t timeout] var...  — read a line, split on IFS
+ *  -t gives a timeout in seconds (fractions allowed, as in bash).
  * ================================================================ */
 int builtin_read(int argc, char **argv) {
     int raw = 0;
     char *prompt = NULL;
+    double timeout = -1.0;      /* < 0 means "wait forever" */
     int i;
 
     for (i = 1; i < argc; i++) {
@@ -1927,7 +1936,17 @@ int builtin_read(int argc, char **argv) {
             prompt = argv[++i];
             continue;
         }
-        if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) { ++i; continue; }
+        if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            char *end;
+            double t = strtod(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || t < 0) {
+                fprintf(stderr, "besh: read: %s: invalid timeout specification\n",
+                        argv[i]);
+                return 1;           /* bash uses 1 for a bad option argument */
+            }
+            timeout = t;
+            continue;
+        }
         break;
     }
 
@@ -1937,6 +1956,7 @@ int builtin_read(int argc, char **argv) {
     }
 
     char buf[MAX_LINE];
+    int read_timed_out = 0;
     /* Read straight from fd 0 rather than through the stdio `stdin`
      * buffer.  Redirections are installed with dup2() behind stdio's
      * back, so a FILE * left in its end-of-file state (which is exactly
@@ -1946,7 +1966,23 @@ int builtin_read(int argc, char **argv) {
     {
         size_t n = 0;
         int got_any = 0;
+        int timed_out = 0;
         while (n < sizeof(buf) - 1) {
+            /* With -t, wait for readability before each byte so the whole
+             * read can be abandoned.  bash reports status > 128 and leaves
+             * the variable empty when the timeout fires before any input. */
+            if (timeout >= 0.0 && !got_any) {
+                fd_set rfds;
+                struct timeval tv;
+                FD_ZERO(&rfds);
+                FD_SET(STDIN_FILENO, &rfds);
+                tv.tv_sec  = (time_t)timeout;
+                tv.tv_usec = (suseconds_t)((timeout - (double)tv.tv_sec) * 1e6);
+                int s = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+                if (s == 0) { timed_out = 1; break; }
+                if (s < 0 && errno != EINTR) break;
+                if (s < 0) continue;            /* EINTR → retry */
+            }
             char ch;
             ssize_t r = read(STDIN_FILENO, &ch, 1);
             if (r < 0) {
@@ -1958,7 +1994,14 @@ int builtin_read(int argc, char **argv) {
             if (ch == '\n') break;
             buf[n++] = ch;
         }
-        if (!got_any) return 1;             /* EOF, nothing read */
+        if (timed_out) {
+            /* bash reports a status above 128 and leaves the variables set
+             * but empty, so the caller can use `if read -t 1 x; then ...` */
+            read_timed_out = 1;
+            buf[0] = '\0';
+        } else if (!got_any) {
+            return 1;                       /* EOF, nothing read */
+        }
         buf[n] = '\0';
         /* a partial last line still counts as a line */
     }
@@ -1983,7 +2026,7 @@ int builtin_read(int argc, char **argv) {
     if (i >= argc) {
         /* no variable given → REPLY */
         sh_setenv("REPLY", buf, 0);
-        return 0;
+        return read_timed_out ? 142 : 0;
     }
 
     int nvars = argc - i;
@@ -2021,7 +2064,9 @@ int builtin_read(int argc, char **argv) {
             sh_setenv(argv[i + v], "", 0);
         }
     }
-    return 0;
+    /* bash uses >128 to signal "the timeout expired"; the variables have
+     * still been assigned (empty), so `read -t 1 x || echo timeout` works. */
+    return read_timed_out ? 142 : 0;
 }
 
 /* ================================================================

@@ -377,6 +377,20 @@ static char *expand_braced(const char **pp) {
                     goto done;
                 }
             }
+            /* Plain ${#name} — the operand must actually be a name.  Anything
+             * else here means a length applied to a string operator, as in
+             * ${#v#pat}, which bash rejects as a bad substitution.  Silently
+             * returning 0 for it (as this used to) hides a real script bug.
+             * Like the indirect-expansion errors below, this is fatal for a
+             * non-interactive shell — bash aborts rather than continue with
+             * a nonsense value. */
+            if (nl == 0 || rst[0] != '\0') {
+                fprintf(stderr, "besh: ${#%s}: bad substitution\n", op);
+                sh->exit_status = 1;
+                if (!sh->job_interactive) exit(1);
+                result = sh_strdup("");
+                goto done;
+            }
             int set;
             char *v = param_get(op, &set);
             char b[32];
@@ -1419,6 +1433,33 @@ char *unescape_token(const char *s) {
     return out;
 }
 
+/* Reduce a lexer token to the word it denotes for a *quoted delimiter*:
+ * surrounding quotes are removed and backslash escapes resolved.
+ *
+ * A here-document delimiter is not a normal word — bash compares the line
+ * literally against the delimiter, so `<<'EOF'` and `<<\EOF` both mean the
+ * word `EOF`, and the quotes additionally suppress expansion in the body.
+ * read_word() keeps the quote characters in the token (the expansion phase
+ * removes them via unescape_token), but the delimiter is taken as a plain
+ * word by the parser, so it must strip them here. */
+char *strip_quotes(const char *s) {
+    if (!s) return sh_strdup("");
+    char *out = sh_malloc(strlen(s) + 1);
+    int o = 0;
+    for (const char *p = s; *p; ) {
+        if (*p == '\\' && p[1]) {
+            out[o++] = p[1];        /* \X -> X */
+            p += 2;
+        } else if (*p == '\'' || *p == '"') {
+            p++;                    /* drop the quote itself */
+        } else {
+            out[o++] = *p++;
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
 /* apply brace expansion / globbing / protection-removal to one fully
  * expanded string and append the resulting word(s) to `result`.
  * Takes ownership of `expanded`. */
@@ -1775,13 +1816,13 @@ char **expand_words_q(char **words, int *quoted, int *count) {
             int pspid = -1;
             char *path = expand_process_sub(words[i], &pspid);
             if (path) {
-                if (pspid > 0) {
-                    Shell *shp = shell_get();
-                    if (shp->npsub < MAX_PSUB) {
-                        shp->psub_pids[shp->npsub] = pspid;
-                        shp->npsub++;
-                    }
-                }
+                /* Record both the child and the parent-side descriptor it
+                 * was given.  The descriptor is named in the /dev/fd/N path
+                 * below and must stay open until the command has actually
+                 * run; psub_reap() closes and waits for it afterwards. */
+                const char *slash = strrchr(path, '/');
+                int pfd = (slash && slash[1]) ? atoi(slash + 1) : -1;
+                psub_register(pspid, pfd);
                 if (nresult < MAX_ARGS - 1) result[nresult++] = path;
                 else free(path);
             } else if (nresult < MAX_ARGS - 1) {
@@ -2129,29 +2170,55 @@ static char **brace_rec(const char *s, int *count) {
                 char num[32];
                 for (int v = lo; v <= hi; v++) {
                     snprintf(num, sizeof(num), "%d", v);
-                    if (nout >= cap) { cap *= 2; out = sh_realloc(out, cap * sizeof(char *)); }
                     size_t plen = strlen(prefix), nlen = strlen(num), slen = strlen(suffix);
                     char *combined = sh_malloc(plen + nlen + slen + 1);
                     memcpy(combined, prefix, plen);
                     memcpy(combined + plen, num, nlen);
                     memcpy(combined + plen + nlen, suffix, slen);
                     combined[plen + nlen + slen] = '\0';
-                    out[nout++] = combined;
+
+                    /* Recurse: a range may be followed by further braces
+                     * (`{1..5}{a,b}`), and those must be expanded too.  The
+                     * list branch below already does this; the range branch
+                     * used to emit its products verbatim, so any brace to
+                     * the right survived into the output as literal text. */
+                    int subc = 0;
+                    char **sub = brace_rec(combined, &subc);
+                    free(combined);
+                    for (int j = 0; j < subc; j++) {
+                        if (nout >= cap) { cap = cap ? cap * 2 : 2;
+                                           out = sh_realloc(out, cap * sizeof(char *)); }
+                        out[nout++] = sub[j];
+                    }
+                    free(sub);
                 }
             } else {
                 char chbuf[2] = { 0, 0 };
                 for (char v = cl; v <= ch; v++) {
                     chbuf[0] = v;
-                    if (nout >= cap) { cap *= 2; out = sh_realloc(out, cap * sizeof(char *)); }
                     size_t plen = strlen(prefix), nlen = 1, slen = strlen(suffix);
                     char *combined = sh_malloc(plen + nlen + slen + 1);
                     memcpy(combined, prefix, plen);
                     memcpy(combined + plen, chbuf, 1);
                     memcpy(combined + plen + nlen, suffix, slen);
                     combined[plen + nlen + slen] = '\0';
-                    out[nout++] = combined;
+
+                    int subc = 0;
+                    char **sub = brace_rec(combined, &subc);
+                    free(combined);
+                    for (int j = 0; j < subc; j++) {
+                        if (nout >= cap) { cap = cap ? cap * 2 : 2;
+                                           out = sh_realloc(out, cap * sizeof(char *)); }
+                        out[nout++] = sub[j];
+                    }
+                    free(sub);
                 }
             }
+            /* Reserve the terminator: the loop above only grows the array
+             * when `nout >= cap` before storing, so a full final iteration
+             * leaves nout == cap and out[nout] would be one past the end.
+             * ASan caught this on `pre{1..2}post`. */
+            if (nout >= cap) { cap = nout + 1; out = sh_realloc(out, cap * sizeof(char *)); }
             out[nout] = NULL;
 
             free(prefix);
@@ -2192,6 +2259,11 @@ static char **brace_rec(const char *s, int *count) {
         }
         free(sub);
     }
+    /* Reserve the NULL terminator.  Each iteration above only grows the
+     * array when `nout >= cap` *before* storing, so after the last store
+     * `nout` can equal `cap` — writing out[nout] then runs one element
+     * past the end (found by ASan on `{a,b}{1,2}`). */
+    if (nout >= cap) { cap = nout + 1; out = sh_realloc(out, cap * sizeof(char *)); }
     out[nout] = NULL;
 
     free(prefix);

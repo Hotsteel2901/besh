@@ -17,6 +17,7 @@ Lexer *lexer_new(const char *input) {
     l->token_type = 0;
     l->token_text = NULL;
     l->token_quoted = 0;
+    l->token_escaped = 0;
     l->token_fd = -1;
     return l;
 }
@@ -504,6 +505,7 @@ static char *read_word(Lexer *l) {
                     lex_append(&buf, &blen, &bcap, (unsigned char)n);
                 else
                     lex_append_raw(&buf, &blen, &bcap, (unsigned char)n);
+                l->token_escaped = 1;   /* `\X` in a word: see <<\EOF */
                 l->pos++;
             }
             continue;
@@ -549,15 +551,33 @@ static char *read_word(Lexer *l) {
 }
 
 /* read here-document content */
-char *lexer_heredoc(Lexer *l, const char *delim, int strip_tabs) {
+/* Read a here-document body.
+ *
+ * Two callers exist and they arrive with `l` in different places:
+ *
+ *   - the historical in-line case, where the lexer stopped just after the
+ *     `<<DELIM` word: the rest of the current line must be skipped before
+ *     the body starts;
+ *   - the deferred case used by parse_redirection, where the whole command
+ *     line has already been consumed and `l->pos` sits at the newline that
+ *     ends it (or just past it).
+ *
+ * `line_consumed` selects between the two, so the body is located the same
+ * way regardless of when the read happens.  Every `<<` on a line is read
+ * this way, in declaration order, which is what makes `cat <<A <<B` work. */
+char *lexer_heredoc_ex(Lexer *l, const char *delim, int strip_tabs,
+                       int line_consumed) {
     char *buf = sh_malloc(HEREDOC_BUF);
     int blen = 0, bcap = HEREDOC_BUF;
     int dlen = strlen(delim);
 
-    /* advance past << or <<- and the delimiter */
-    while (l->pos < l->len && l->input[l->pos] != '\n')
-        l->pos++;
-    if (l->pos < l->len) l->pos++;  /* skip newline */
+    /* advance past << or <<- and the delimiter, and the newline that ends
+     * the command line on which the here-document was declared */
+    if (!line_consumed) {
+        while (l->pos < l->len && l->input[l->pos] != '\n')
+            l->pos++;
+        if (l->pos < l->len) l->pos++;  /* skip newline */
+    }
 
     while (l->pos < l->len) {
         /* start of a line */
@@ -601,6 +621,12 @@ char *lexer_heredoc(Lexer *l, const char *delim, int strip_tabs) {
     fprintf(stderr, "besh: warning: here-document at line %d delimited by "
             "end-of-file (wanted `%s')\n", l->lineno, delim);
     return buf;
+}
+
+/* In-line form: the lexer is still sitting on the `<<DELIM` word of the
+ * current line, so the body starts after that line's newline. */
+char *lexer_heredoc(Lexer *l, const char *delim, int strip_tabs) {
+    return lexer_heredoc_ex(l, delim, strip_tabs, 0);
 }
 
 /* ================================================================
@@ -714,6 +740,7 @@ int lexer_next(Lexer *l) {
     free(l->token_text);
     l->token_text = NULL;
     l->token_quoted = 0;
+    l->token_escaped = 0;
     l->token_fd = -1;
 
     lexer_skip_whitespace(l);

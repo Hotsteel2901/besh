@@ -1,0 +1,34 @@
+cat <<A <<B
+first body
+A
+second body
+B
+echo "--- single ---"
+cat <<EOF
+hello
+EOF
+echo "--- three ---"
+cat <<P <<Q <<R
+one
+P
+two
+Q
+three
+R
+echo "--- quoted delim ---"
+cat <<'E'
+no $expansion here
+E
+echo "--- with other redirs ---"
+# NB: no $$ in the filename — the PID differs between bash and besh by
+# definition, so the diff would never converge.
+cat <<X > /tmp/besh_hd_test
+from heredoc
+X
+cat /tmp/besh_hd_test
+rm -f /tmp/besh_hd_test
+echo "--- inside if ---"
+if cat <<Y
+body in if
+Y
+then echo "if-took-heredoc"; fi

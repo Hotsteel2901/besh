@@ -10,7 +10,7 @@ SRCS    := main.c lexer.c parser.c executor.c builtins.c expand.c
 OBJS    := $(SRCS:.c=.o)
 TARGET  := besh
 
-.PHONY: all clean run test test-diff test-interactive
+.PHONY: all clean run test test-diff test-interactive test-asan asan
 
 all: $(TARGET)
 
@@ -25,6 +25,17 @@ clean:
 
 run: $(TARGET)
 	./$(TARGET)
+
+# --- sanitizer build ------------------------------------------------
+# The test suite only proves that besh *agrees* with bash; it cannot see a
+# buffer overrun that happens to produce the right bytes.  Several real
+# defects were found only under ASan, so this target exists to keep the
+# option in reach.
+ASAN_FLAGS := -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
+asan:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="-Wall -Wextra $(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined"
+	@echo "built ./$(TARGET) with ASan+UBSan"
 
 # --- tests -----------------------------------------------------------
 # test-diff        24 cases run under both bash and besh; outputs diffed

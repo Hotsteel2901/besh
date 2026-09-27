@@ -1,0 +1,18 @@
+# Regression: `echo -e '\c'` must flush what it already emitted.
+#
+# echo is a builtin, so there is no process exit to flush stdio for it.
+# Returning early on `\c` without a flush left the bytes buffered, and the
+# file stayed empty until some later flush happened to occur.
+
+rm -f /tmp/besh_echo_c
+echo -e 'aaa\cbbb' > /tmp/besh_echo_c
+# wc runs in a child; if the parent's buffer were still unflushed the file
+# would be 0 bytes here (it was, before the fix).
+wc -c < /tmp/besh_echo_c
+
+echo -e 'n1\nn2\cSHOULD-NOT-APPEAR' > /tmp/besh_echo_c2
+cat /tmp/besh_echo_c2
+echo ""
+
+rm -f /tmp/besh_echo_c /tmp/besh_echo_c2
+echo done

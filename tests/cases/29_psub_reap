@@ -1,0 +1,30 @@
+# Regression: process substitution must not leak descriptors or children.
+#
+# `diff <(...) <(...)` writes two /dev/fd/N paths and forks two children.
+# Before psub_reap() existed the descriptors were never closed and the
+# children were never waited on, so a loop like this one climbed to ~85
+# open descriptors (bash stays at 4) and left one zombie per iteration.
+
+i=0
+while [ $i -lt 20 ]; do
+    diff <(echo $i) <(echo $i) > /dev/null
+    i=$((i + 1))
+done
+echo "loop done"
+
+# Only the shell's own descriptors (0,1,2 plus whatever the test runner
+# holds) should remain — a leak would show up as ~40 here.
+n=$(ls /proc/self/fd | wc -l)
+if [ "$n" -le 8 ]; then
+    echo "fd count ok"
+else
+    echo "fd count too high: $n"
+fi
+
+# <( ) used as a command argument, not a redirection: this is the path
+# that used to leak, because only the redirection path closed the fd.
+cat <(echo psub-argument-works)
+
+# >( ) must still deliver its output
+echo via-output-psub > >(cat)
+wait

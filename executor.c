@@ -49,9 +49,10 @@ static const char *redir_resolve_name_ex(const char *name, int *psub_fd,
         int pid = -1;
         char *path = expand_process_sub(name, &pid);
         if (path) {
-            Shell *sh = shell_get();
-            if (pid > 0 && sh->npsub < MAX_PSUB)
-                sh->psub_pids[sh->npsub++] = pid;
+            /* The descriptor is handed to the caller through *psub_fd and
+             * closed there once the redirection is installed; only the child
+             * is queued here, for psub_reap() to wait on. */
+            psub_register(pid, -1);
             if (psub_fd) {
                 /* the pathname is /dev/fd/N — recover N */
                 const char *slash = strrchr(path, '/');
@@ -1097,6 +1098,12 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
      * instead would silently disable `set -e` for everything below. */
     int exempt_errexit = 0;
 
+    /* Reclaim any process substitution left over from the previous node.
+     * Doing it on entry rather than on exit covers every return path in
+     * this (large) function, and inside a loop body the substitution is
+     * released once per iteration instead of at the end of the loop. */
+    psub_reap();
+
     /* `return` unwinds the current function body / sourced file */
     if (sh->return_request) return sh->exit_status;
 
@@ -1431,6 +1438,57 @@ int execute_node(ASTNode *node, int *piped_fds) {
 }
 
 /* ---- execute a string (parse + execute) ---------------------- */
+/* Register a process-substitution child (and optionally the pipe end still
+ * owned by the shell) for later reclamation.  `fd` is -1 when a redirection
+ * took ownership of the descriptor instead.  The arrays grow on demand so a
+ * line with many substitutions cannot silently lose track of any of them. */
+void psub_register(int pid, int fd) {
+    Shell *sh = shell_get();
+    if (pid <= 0 && fd < 0) return;
+    if (sh->npsub == sh->psub_cap) {
+        sh->psub_cap = sh->psub_cap ? sh->psub_cap * 2 : 16;
+        sh->psub_pids = sh_realloc(sh->psub_pids,
+                                   (size_t)sh->psub_cap * sizeof(int));
+        sh->psub_fds  = sh_realloc(sh->psub_fds,
+                                   (size_t)sh->psub_cap * sizeof(int));
+    }
+    sh->psub_pids[sh->npsub] = pid;
+    sh->psub_fds[sh->npsub]  = fd;
+    sh->npsub++;
+}
+
+/* Release everything a process substitution left behind.
+ *
+ * `<(...)` / `>(...)` forks a child and hands the command a /dev/fd/N path.
+ * Once that command has run, two things must happen or the shell degrades:
+ *
+ *   - close the parent-side descriptor, so the child writing into the pipe
+ *     actually observes EOF (a leaked descriptor also keeps the pipe alive,
+ *     which is why a later `while ... < <(...)` would read nothing), and
+ *   - wait for the child, so it does not linger as a zombie for the whole
+ *     session.
+ *
+ * Descriptors already handed to a redirection are closed by that caller
+ * (they are recorded as -1 here); only the ones still owned by this queue
+ * are closed.  Called at the end of every top-level command line, which is
+ * where bash finalises substitutions too. */
+void psub_reap(void) {
+    Shell *sh = shell_get();
+    if (sh->npsub == 0) return;
+
+    for (int i = 0; i < sh->npsub; i++) {
+        if (sh->psub_fds[i] >= 0) close(sh->psub_fds[i]);
+    }
+    for (int i = 0; i < sh->npsub; i++) {
+        if (sh->psub_pids[i] > 0) {
+            int status;
+            while (waitpid(sh->psub_pids[i], &status, 0) < 0 && errno == EINTR)
+                ;
+        }
+    }
+    sh->npsub = 0;
+}
+
 int execute_string(const char *cmd) {
     if (!cmd || !*cmd) return 0;
 
@@ -1453,6 +1511,7 @@ int execute_string(const char *cmd) {
 
     ast_free(ast);
     lexer_free(l);
+    psub_reap();          /* close pipes, reap children from <( ) / >( ) */
     job_notify();
     return ret;
 }

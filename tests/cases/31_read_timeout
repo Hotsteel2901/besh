@@ -1,0 +1,29 @@
+# Regression: read -t must implement a real timeout, not silently block.
+#
+# The option used to be parsed and discarded, so `read -t 0.2 x` blocked
+# forever instead of returning when the deadline passed.
+
+# no input at all: the timeout must fire
+( sleep 5 ) | {
+    read -t 0.2 x
+    echo "timeout-status=$?"
+    echo "value=[$x]"
+}
+
+# input available before the deadline: normal read, status 0
+echo "hello world" | {
+    read -t 2 a b
+    echo "normal-status=$? a=[$a] b=[$b]"
+}
+
+# an invalid argument must be rejected rather than ignored
+# (the exact wording/line prefix differs between shells, so only the
+# status code is compared)
+read -t notanumber x 2>/dev/null
+echo "invalid-status=$?"
+
+# a timeout with no variable still assigns nothing to REPLY
+( sleep 5 ) | {
+    read -t 0.2
+    echo "reply-timeout-status=$?"
+}

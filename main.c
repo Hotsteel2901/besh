@@ -1332,6 +1332,7 @@ static void line_complete(void) {
 
     char *file_part = NULL;
     char dir_path[MAX_PATH] = ".";
+    char fullp[MAX_PATH * 2];   /* dir_path + '/' + a NAME_MAX component */
 
     /* split into directory and file prefix */
     char *slash = strrchr(word, '/');
@@ -1388,7 +1389,6 @@ static void line_complete(void) {
             matches[nmatch] = sh_strdup(ent->d_name);
             /* if it's a directory, append / */
             struct stat st;
-            char fullp[MAX_PATH];
             snprintf(fullp, sizeof(fullp), "%s/%s", dir_path, ent->d_name);
             if (stat(fullp, &st) == 0 && S_ISDIR(st.st_mode)) {
                 int sl = strlen(matches[nmatch]);
@@ -1416,17 +1416,25 @@ static int reverse_search(void) {
     char pattern[MAX_LINE] = "";
     int plen = 0;
     char *saved = sh_strdup(sh->line_buf);
-    int cur = sh->nhist;      /* current match index */
+    int cur = sh->nhist;      /* current match index (== nhist: no match) */
+    /* Where the next search starts, scanning downwards.  Editing the pattern
+     * restarts from the newest entry; Ctrl-R resumes just above the current
+     * match.  Keeping this in a variable (rather than re-deriving `cur` at
+     * the top of the loop) is what makes repeated Ctrl-R walk back through
+     * the history instead of re-finding the same newest match. */
+    int search_from = sh->nhist;
     static char buf[131072];
 
     for (;;) {
-        /* find the newest entry containing the pattern */
+        /* find the newest entry at or above `search_from` containing it */
         cur = sh->nhist;
         if (plen > 0) {
-            for (int i = sh->nhist - 1; i >= 0; i--) {
+            for (int i = search_from - 1; i >= 0; i--) {
                 if (strstr(sh->history[i], pattern)) { cur = i; break; }
             }
         }
+        /* The next Ctrl-R continues from just above whatever we found. */
+        search_from = (cur < sh->nhist) ? cur : 0;
 
         int pos = 0;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -1461,11 +1469,8 @@ static int reverse_search(void) {
             return 0;
         }
         if (key == 18) {                        /* Ctrl-R: previous match */
-            if (plen > 0) {
-                for (int i = cur - 1; i >= 0; i--) {
-                    if (strstr(sh->history[i], pattern)) { cur = i; break; }
-                }
-            }
+            /* search_from already points just above the current match, so
+             * simply looping again walks one entry further back. */
             continue;
         }
         if (key == 127 || key == 8 || key == '\b') { /* backspace */
@@ -1478,12 +1483,14 @@ static int reverse_search(void) {
                 line_refresh();
                 return 0;
             }
+            search_from = sh->nhist;   /* pattern changed → search afresh */
             continue;
         }
         if (key >= 32 && key < 127) {           /* printable */
             if (plen < (int)sizeof(pattern) - 1)
                 pattern[plen++] = (char)key;
             pattern[plen] = '\0';
+            search_from = sh->nhist;   /* pattern changed → search afresh */
             continue;
         }
     }
@@ -1762,13 +1769,30 @@ int sh_input_incomplete(const char *input) {
      * `&>`/`>&`/`>|` are complete on their own; a bare `>`/`<` opens a slot
      * for the target word, which may turn out to be a heredoc delimiter. */
     /* Pending here-document awaiting its body.  A single `<<` operator may
-     * declare more than one here-doc on one line (`cat <<A <<B`), so this is
-     * a bounded FIFO of delimiters. */
-    char hd_delim[4][128];
-    int  hd_strip[4];
-    int  hd_n = 0;          /* delimiters queued, not yet satisfied */
-    int  hd_head = 0;       /* current delimiter index              */
-    int  hd_scan = 0;       /* 1 = we are consuming a here-doc body */
+     * declare more than one here-doc on one line (`cat <<A <<B`), and the
+     * number is unbounded — bash accepts `cat <<A <<B <<C <<D <<E` — so the
+     * queue grows on demand instead of living in a fixed stack array. */
+    char (*hd_delim)[128] = NULL;
+    int  *hd_strip        = NULL;
+    int   hd_cap          = 0;
+    int   hd_n            = 0;   /* delimiters queued, not yet satisfied */
+    int   hd_head         = 0;   /* current delimiter index              */
+    int   hd_scan         = 0;   /* 1 = we are consuming a here-doc body */
+
+    /* append a fresh slot for a `<<` / `<<-` operator */
+    #define HD_PUSH(strip)                                            \
+        do {                                                          \
+            if (hd_n == hd_cap) {                                     \
+                hd_cap = hd_cap ? hd_cap * 2 : 8;                     \
+                hd_delim = sh_realloc(hd_delim,                       \
+                                      (size_t)hd_cap * sizeof(*hd_delim)); \
+                hd_strip = sh_realloc(hd_strip,                       \
+                                      (size_t)hd_cap * sizeof(*hd_strip)); \
+            }                                                         \
+            hd_strip[hd_n] = (strip);                                  \
+            hd_delim[hd_n][0] = '\0';                                  \
+            hd_n++;                                                    \
+        } while (0)
 
     for (int i = 0; i < n; i++) {
         char c = input[i];
@@ -1804,37 +1828,30 @@ int sh_input_incomplete(const char *input) {
             continue;
         }
         if (in_s) {
-            if (c == '\'') in_s = 0;
+            if (c == '\'') { in_s = 0; continue; }
+            /* quoted text still belongs to the current word; its purpose
+             * here is delimiter / last-word detection, which is quoting-
+             * agnostic after quote removal */
+            if (wl < (int)sizeof(word) - 1) word[wl++] = c;
             continue;
         }
         if (in_d) {
             if (c == '\\') { esc = 1; continue; }
-            if (c == '"') in_d = 0;
+            if (c == '"') { in_d = 0; continue; }
+            if (wl < (int)sizeof(word) - 1) word[wl++] = c;
             continue;
         }
         if (c == '\\') { esc = 1; continue; }
         if (c == '\'') {
-            word[wl] = '\0';
-            if (hd_n > hd_head && hd_delim[hd_n - 1][0] == '\0' && wl) {
-                /* a quoted delimiter disables expansion inside the body */
-                snprintf(hd_delim[hd_n - 1], sizeof(hd_delim[0]), "%s", word);
-            }
-            incompleteness_word(word, &n_if, &n_fi, &n_do,
-                &n_done, &n_case, &n_esac, &n_head, &cmd_pos, &last_op);
-            if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
-            wl = 0;
+            /* A quote does not end the word: `<<'E'` denotes the delimiter E
+             * (quote removal happens at the shell level).  Flushing `word`
+             * here — as this used to — captured nothing but the empty string
+             * before the quote, so the body was never matched against `E`.
+             * Only a real separator or operator ends a word. */
             in_s = 1;
             continue;
         }
         if (c == '"') {
-            word[wl] = '\0';
-            if (hd_n > hd_head && hd_delim[hd_n - 1][0] == '\0' && wl) {
-                snprintf(hd_delim[hd_n - 1], sizeof(hd_delim[0]), "%s", word);
-            }
-            incompleteness_word(word, &n_if, &n_fi, &n_do,
-                &n_done, &n_case, &n_esac, &n_head, &cmd_pos, &last_op);
-            if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
-            wl = 0;
             in_d = 1;
             continue;
         }
@@ -1895,11 +1912,10 @@ int sh_input_incomplete(const char *input) {
         }
         if (c == '<' && i + 1 < n && input[i + 1] == '<') {
             i++;                          /* consume "<<"  */
-            if (i + 1 < n && input[i + 1] == '-') { i++; hd_strip[hd_n] = 1; }
-            else hd_strip[hd_n] = 0;
-            hd_delim[hd_n][0] = '\0';
+            int strip = 0;
+            if (i + 1 < n && input[i + 1] == '-') { i++; strip = 1; }
+            HD_PUSH(strip);
             wl = 0;                       /* start collecting the delimiter word */
-            hd_n++;                       /* bounded below by the queue size */
             cmd_pos = 0; last_op = 0;
             continue;
         }
@@ -1927,19 +1943,27 @@ int sh_input_incomplete(const char *input) {
     if (wl) snprintf(last_word, sizeof(last_word), "%s", word);
     trailing_esc = esc;
 
-    /* An unterminated here-document keeps the input open.  This is what
-     * makes multi-line scripts and `source` work: the reader must not hand
-     * a `cat <<EOF` line to the parser before its body has arrived. */
-    if (hd_n > 0) return 1;
+    /* Every exit below shares one cleanup point so the dynamically sized
+     * here-document queue can never leak on an early return. */
+    int verdict = 0;
 
-    if (in_s || in_d) return 2;
-    if (trailing_esc || paren > 0 || brace > 0 || last_op) return 1;
-    if (n_head > 0 || n_if > n_fi || n_do > n_done || n_case > n_esac) return 1;
-    if (strcmp(last_word, "then") == 0 || strcmp(last_word, "do") == 0 ||
-        strcmp(last_word, "else") == 0 || strcmp(last_word, "elif") == 0 ||
-        strcmp(last_word, "in") == 0)
-        return 1;
-    return 0;
+    /* A pending here-document keeps the input open.  This is what makes
+     * multi-line scripts and `source` work: the reader must not hand a
+     * `cat <<EOF` line to the parser before its body has arrived. */
+    if (hd_n > 0)                       verdict = 1;
+    else if (in_s || in_d)              verdict = 2;
+    else if (trailing_esc || paren > 0 || brace > 0 || last_op) verdict = 1;
+    else if (n_head > 0 || n_if > n_fi || n_do > n_done || n_case > n_esac)
+                                        verdict = 1;
+    else if (strcmp(last_word, "then") == 0 ||
+             strcmp(last_word, "do")   == 0 ||
+             strcmp(last_word, "else") == 0 ||
+             strcmp(last_word, "elif") == 0 ||
+             strcmp(last_word, "in")   == 0) verdict = 1;
+
+    free(hd_delim);
+    free(hd_strip);
+    return verdict;
 }
 
 /* ================================================================
@@ -2223,6 +2247,16 @@ void shell_destroy(void) {
         history_save();
         term_restore();
     }
+    /* free the process-substitution bookkeeping.  psub_reap() normally
+     * empties this queue after every command; anything still recorded here
+     * at shutdown belongs to a substitution whose command never completed
+     * (e.g. the shell was killed), so close and reap it now. */
+    psub_reap();
+    free(sh->psub_pids);
+    free(sh->psub_fds);
+    sh->psub_pids = NULL;
+    sh->psub_fds = NULL;
+    sh->psub_cap = 0;
     /* free history */
     for (int i = 0; i < sh->nhist; i++) free(sh->history[i]);
     free(sh->history);

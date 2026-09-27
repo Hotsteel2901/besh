@@ -20,7 +20,7 @@ const BUILTINS: { name: string; desc: string; fishZsh?: boolean }[] = [
   { name: "wait", desc: "Wait for jobs" },
   { name: "history", desc: "Command history" },
   { name: "fc", desc: "Re-run / edit history" },
-  { name: "read", desc: "Read a line from stdin" },
+  { name: "read", desc: "Read stdin (-p prompt, -r raw, -t timeout)" },
   { name: "test", desc: "Conditional eval" },
   { name: "[", desc: "Bracket form of test" },
   { name: "true", desc: "Return 0" },

@@ -150,19 +150,12 @@ static Redir *parse_redirection(Lexer *l) {
     memset(r, 0, sizeof(*r));
     r->src_fd = -1;
 
-    /* check if there is an fd number before the operator */
-    int fd_num = -1;
-    if (l->token_fd >= 0) {
-        /* the lexer recognized `N>` / `N<` and put the number on the token */
-        fd_num = l->token_fd;
-    } else if (l->token_type == TOK_WORD) {
-        char *end;
-        long val = strtol(l->token_text, &end, 10);
-        if (*end == '\0' && end != l->token_text) {
-            fd_num = (int)val;
-            lexer_next(l);  /* consume the fd number */
-        }
-    }
+    /* The fd prefix (`2>`, `3>&1`, `2>>`, ...) has already been consumed by
+     * the lexer, which records the number in token_fd.  There is no
+     * "bare number in front of a redirection" case left to handle here:
+     * `echo 3 >f` lexes `3` as an ordinary word argument, which is exactly
+     * what bash does too. */
+    int fd_num = (l->token_fd >= 0) ? l->token_fd : -1;
 
     int tok = l->token_type;
 
@@ -292,12 +285,18 @@ static Redir *parse_redirection(Lexer *l) {
             fprintf(stderr, "besh: parse error: expected here-document delimiter\n");
             r->filename = sh_strdup("EOF");
         } else {
-            r->filename = unescape_token(l->token_text);
-            r->quoted = l->token_quoted;
-            /* read heredoc content */
-            r->heredoc = lexer_heredoc(l, r->filename,
-                                       tok == TOK_DLESSDASH);
-            /* refresh token — lexer_heredoc advanced pos past the body */
+            /* Quote removal: `<<'EOF'` and `<<\EOF` both denote the word
+             * EOF, and both suppress expansion inside the body. */
+            r->filename = strip_quotes(l->token_text);
+            r->quoted = l->token_quoted || l->token_escaped;
+            /* Only record the declaration here.  Reading the body now would
+             * be wrong for `cat <<A <<B`: bodies are taken from the lines
+             * following the *entire* command line, in declaration order, so
+             * the reader must first see every `<<` on the line.  The caller
+             * (parse_command) collects the list and calls
+             * lexer_heredoc() for each in turn once the line is consumed. */
+            r->heredoc = NULL;
+            r->delim_pending = 1;
             lexer_next(l);
         }
     } else {
@@ -377,6 +376,21 @@ static ASTNode *parse_simple_command(Lexer *l) {
         break;
     }
 
+    /* The command line is fully consumed, so the here-document bodies that
+     * follow it can now be read — in declaration order, which is exactly
+     * the order of the redirection chain.  `cat <<A <<B` therefore yields
+     * B's body as stdin, matching bash, and no declaration is skipped.
+     * (bash reads them in the same pass; separating the two phases is what
+     * lets every `<<` on the line be seen before the first body is taken.) */
+    for (Redir *hr = node->redirs; hr; hr = hr->next) {
+        if (!hr->delim_pending) continue;
+        hr->delim_pending = 0;
+        hr->heredoc = lexer_heredoc_ex(l, hr->filename,
+                                       hr->type == REDIR_HEREDOC_DASH, 1);
+        /* lexer_heredoc_ex advanced pos past the body — refresh lookahead */
+        lexer_next(l);
+    }
+
     /* check if first word is a builtin alias — expand it */
     if (node->argc > 0) {
         Shell *sh = shell_get();
@@ -451,6 +465,16 @@ static void parse_compound_redirs(Lexer *l, ASTNode *node) {
         if (!node->redirs) node->redirs = r;
         else last->next = r;
         last = r;
+    }
+
+    /* see parse_command: heredoc bodies are read after every declaration
+     * on the line has been collected, in declaration order */
+    for (Redir *hr = node->redirs; hr; hr = hr->next) {
+        if (!hr->delim_pending) continue;
+        hr->delim_pending = 0;
+        hr->heredoc = lexer_heredoc_ex(l, hr->filename,
+                                       hr->type == REDIR_HEREDOC_DASH, 1);
+        lexer_next(l);
     }
 }
 
@@ -743,9 +767,11 @@ static ASTNode *parse_for(Lexer *l) {
         words_node->argv_quoted = sh_malloc(words_node->argv_cap * sizeof(int));
         words_node->argc = 0;
 
+        /* `;` terminates the word list, but it arrives as TOK_SEMI (not a
+         * word), so the loop condition below already stops on it — testing
+         * for it in token_text was dead code. */
         while (l->token_type == TOK_WORD &&
-               strcmp(l->token_text, "do") != 0 &&
-               strcmp(l->token_text, ";") != 0) {
+               strcmp(l->token_text, "do") != 0) {
             if (words_node->argc >= words_node->argv_cap - 1) {
                 words_node->argv_cap *= 2;
                 words_node->argv = sh_realloc(words_node->argv,

@@ -30,3 +30,17 @@ jobs:
 
       - name: Interactive suite (pty: line editor, history, completion)
         run: python3 tests/interactive.py
+
+      # The differential suite proves besh agrees with bash; it cannot see a
+      # buffer overrun that happens to produce the right bytes.  Three real
+      # memory bugs (two brace-expansion overruns, and a here-doc queue that
+      # grew past its fixed array) were only visible under a sanitizer, so it
+      # runs here too.  This is the last build step, so the sanitized binary
+      # is simply discarded afterwards.
+      - name: Build with sanitizers
+        run: make asan
+
+      - name: Differential suite under ASan + UBSan
+        run: |
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 tests/run.sh
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 python3 tests/interactive.py

@@ -122,6 +122,7 @@ typedef struct Redir {
     int            fd;          /* fd number for dup redirs     */
     int            src_fd;      /* source fd (stdin/stdout/err) */
     int            quoted;      /* 1 if heredoc delim was quoted */
+    int            delim_pending; /* 1 = heredoc body not read yet */
     struct Redir *next;
 } Redir;
 
@@ -326,10 +327,20 @@ typedef struct Shell {
                                   * enclosing NODE_LIST stay quiet */
 
     /* process substitution: pids of the children spawned for <(...) /
-     * >(...).  They are reaped like background jobs so they do not turn
-     * into zombies, and `wait` can be used to synchronise with them. */
-    int          psub_pids[MAX_PSUB];
+     * >(...), and the parent-side pipe descriptors handed out as /dev/fd/N.
+     * Both are collected here and released by psub_reap() once the command
+     * that used them has finished: the fd must be closed (otherwise the
+     * child's writer never sees EOF and the loop leaks descriptors until
+     * EMFILE), and the pid must be waited on (otherwise it turns into a
+     * zombie for the lifetime of the shell).
+     *
+     * Grown on demand: a single line may legally contain more `<(...)` than
+     * any fixed capacity, and silently dropping the overflow would leak
+     * exactly the resources this queue exists to reclaim. */
+    int         *psub_pids;
+    int         *psub_fds;
     int          npsub;
+    int          psub_cap;
 
     /* line-editor state */
     char        *line_buf;
@@ -376,6 +387,10 @@ typedef struct {
     int         token_type;
     char       *token_text;
     int         token_quoted;    /* 1 if token came from quotes   */
+    int         token_escaped;   /* 1 if token contained a backslash escape.
+                                  * Used for here-document delimiters, where
+                                  * bash treats `<<\EOF` like `<<'EOF'`
+                                  * (quote removal, no body expansion). */
     int         token_fd;        /* fd number for `N>`/`N<` tokens,
                                   * -1 when the token carried none  */
 } Lexer;
@@ -384,6 +399,8 @@ Lexer *lexer_new(const char *input);
 void   lexer_free(Lexer *l);
 int    lexer_next(Lexer *l);     /* returns token type            */
 char  *lexer_heredoc(Lexer *l, const char *delim, int strip_tabs);
+char  *lexer_heredoc_ex(Lexer *l, const char *delim, int strip_tabs,
+                        int line_consumed);
 
 /* -------------------------------------------------------------------
  *  parser.c
@@ -399,6 +416,8 @@ int  execute_node(ASTNode *node, int *piped_fds);
 int  execute_pipeline(ASTNode *pipeline);
 int  execute_command(ASTNode *node);
 int  execute_string(const char *cmd);
+void psub_register(int pid, int fd);
+void psub_reap(void);
 
 /* -------------------------------------------------------------------
  *  builtins.c
@@ -468,6 +487,7 @@ char **expand_words_q(char **words, int *quoted, int *count);
 char *expand_process_sub(const char *word, int *pid);
 char  *unescape_word(const char *str);
 char  *unescape_token(const char *str);
+char  *strip_quotes(const char *str);
 char  *tilde_expand(const char *str);
 char **glob_expand(const char *pattern, int *count);
 char **brace_expand(const char *str, int *count);

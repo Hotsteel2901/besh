@@ -41,7 +41,7 @@ export default function Hero() {
       </div>
 
       <div className="relative z-10 flex w-full max-w-3xl flex-col items-center text-center">
-        <span className="chip mb-7 tracking-[0.2em]">v1.2.0 · 11.7k lines of C · zero dependencies</span>
+        <span className="chip mb-7 tracking-[0.2em]">v1.2.0 · 12.0k lines of C · zero dependencies</span>
 
         <h1 className="font-display text-6xl font-black uppercase leading-none tracking-[0.08em] sm:text-7xl md:text-8xl">
           <span className="bg-gradient-to-r from-[#e8eaf6] via-[#c4b5fd] to-[#4ade80] bg-clip-text text-transparent">

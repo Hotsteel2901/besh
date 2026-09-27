@@ -205,6 +205,51 @@ npm run build                # 静态导出到 web/out（GitHub Pages 部署）
 | 退格按字节处理，多字节字符会残留半个字节 | 已改为按码点处理 |
 | 历史无时间戳、无 `fc` | 已有 bash 格式时间戳，`fc -l/-s/-e` 全部可用 |
 | `fc`、`compgen`、`command_not_found_handler`、补全脚本未实现 | 均以实现，Tab 已接入可编程补全 |
+| `read -t` 接受参数后静默忽略（退化为阻塞读） | 已实现真正的超时（`select` + 期限），超时返回 142，参数非法即报错 |
+| `${#var#pat}` 静默返回 0 | 与 bash 一致报 `bad substitution`，非交互模式下终止脚本 |
+
+### 已修复的正确性缺陷
+
+这些都曾真实存在，多数由测试（含 AddressSanitizer）复现后修掉：
+
+| 缺陷 | 说明 |
+|------|------|
+| heredoc 队列栈溢出 | 同一行 `<<` 超过 4 个（`cat <<A <<B <<C <<D <<E`）会越界写栈数组并崩溃；队列已改为按需增长 |
+| 一行多个 heredoc 被吞 | `cat <<A <<B` 只读取第一个；现在按声明顺序读取全部，最后一个成为 stdin（与 bash 一致） |
+| 引号 / 反斜杠定界符失效 | `<<'EOF'`、`<<\EOF`、`<<"EOF"` 无法匹配结束行；且 `<<\EOF` 的正文被错误地展开 |
+| 进程替换 fd 泄漏 | `<(...)` 用做命令参数时管道端从不由调用方关闭，循环里 40 次迭代泄漏 80 个 fd（bash 保持 4 个） |
+| 进程替换子进程成僵尸 | `psub_pids[]` 只写不读，从不 `waitpid`；实测 30 次迭代累积 30 个僵尸进程。现在每条命令结束统一 `close` + `waitpid` |
+| 进程替换静默丢弃 | 超过 `MAX_PSUB`(128) 的记录被丢弃且不回收；改为动态数组，200 个替换也不泄漏 |
+| `echo -e '\c'` 丢数据 | 提前返回时不 `fflush`，重定向到文件时字节留在 stdio 缓冲，文件为空 |
+| Ctrl-R 无法回溯 | 上次匹配结果被循环顶部重置，反复按 Ctrl-R 始终停在最新一条 |
+| 花括号展开堆溢出 | `{a,b}{1,2}` 与 `pre{1..2}post` 在写入 `NULL` 终止符时越界写一个指针（ASan 发现） |
+| range 后的花括号不展开 | `{1..5}{a,b}` 输出成 `1{a,b} 2{a,b} …`，字面残留 |
+| 重定向目标不展开 | `echo hi > "$f"` 不建文件并报 `File exists` |
+| 重定向失败仍执行 | `open()` 失败被 `if (fd >= 0)` 吞掉，命令照常运行 |
+| `noclobber` 对内建无效 | `set -C` 下 `echo x > existing` 照样覆盖 |
+| `$?` 在双引号内打印字面量 | 词法层把 `?` 转义，展开器认不出参数 |
+| `command_not_found_handler` 收不到参数 | 契约改为 `argv[0]` 即 `$1` |
+| `fc -s` 自我递归 / `fc -e -1` 选错条目 | REPL 把 `fc -s` 自身写入历史后被重新执行 |
+| `help` 列表与注册表不同步 | 硬编码声称 41 个内建而实际 44 个，改为从注册表生成 |
+| `-O2` 下静默截断 | `prompt_render` 与 `gen_files` 把 `MAX_PATH` 长的串写入同样大小的缓冲；CI 曾用 `-Wno-format-truncation` 掩盖，该开关已移除 |
+
+## 测试
+
+```sh
+make test              # 差分套件 + 交互套件 + 演示
+make test-diff         # 38 个用例，逐个与 bash 对比 stdout+stderr
+make test-interactive  # 17 个 pty 检查（行编辑器、历史、补全）
+make asan              # 用 ASan + UBSan 重建
+ASAN_OPTIONS=detect_leaks=0 tests/run.sh   # 在 sanitizer 下跑差分套件
+```
+
+`tests/cases/` 下的每个用例都会同时交给 `bash` 和 `./besh` 执行，
+输出逐字节对比 —— 一致性本身即是断言。`tests/only/` 存放 bash
+没有对应物的 zsh 风格特性，期望输出内嵌在文件里。
+
+CI 会以 `-Werror` 构建、跑两个套件，再用 ASan/UBSan 重跑一遍：
+差分测试只能证明 besh 与 bash *输出相同*，看不出「越界写之后恰好
+产生正确字节」的缺陷，而上面表里有两处正是这种情况。
 
 仍然存在的、有意为之的差异（不打算追平）：
 

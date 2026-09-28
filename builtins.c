@@ -9,6 +9,8 @@
 #include "shell.h"
 #include <ctype.h>
 #include <regex.h>
+#include <limits.h>   /* NAME_MAX, used for filename-completion buffers */
+#include <sys/time.h> /* gettimeofday, for the `read -t` absolute deadline */
 
 /* getcwd() is declared warn_unused_result, which turns every call into a
  * warning.  All our callers either know the buffer is large enough or fall
@@ -105,19 +107,31 @@ int builtin_echo(int argc, char **argv) {
     int i = 1;
     int first_arg;
 
-    /* parse options */
-    while (i < argc && argv[i][0] == '-') {
-        if (strcmp(argv[i], "-n") == 0) {
-            newline = 0; i++;
-        } else if (strcmp(argv[i], "-e") == 0) {
-            interpret_escapes = 1; i++;
-        } else if (strcmp(argv[i], "-E") == 0) {
-            interpret_escapes = 0; i++;
-        } else if (strcmp(argv[i], "--") == 0) {
-            i++; break;
-        } else {
-            break;  /* not a flag */
+    /* parse options
+     *
+     * bash accepts clustered single-letter flags (`echo -ne`, `echo -en`),
+     * and scans the letters left to right so that a later `-e`/`-E`
+     * overrides an earlier one.  Only flags made up entirely of the three
+     * letters n, e and E are options at all — `echo -nfoo` still prints
+     * `-nfoo`, and `echo -` prints `-`. */
+    while (i < argc && argv[i][0] == '-' && argv[i][1]) {
+        const char *fl = argv[i] + 1;
+
+        if (strcmp(fl, "-") == 0) {   /* the lone `--` end-of-options mark */
+            break;
         }
+        int all_flags = 1;
+        for (const char *p = fl; *p; p++)
+            if (*p != 'n' && *p != 'e' && *p != 'E') { all_flags = 0; break; }
+        if (!all_flags)
+            break;  /* not a flag */
+
+        for (const char *p = fl; *p; p++) {
+            if (*p == 'n')      newline = 0;
+            else if (*p == 'e') interpret_escapes = 1;
+            else                interpret_escapes = 0;  /* 'E' */
+        }
+        i++;
     }
     first_arg = i;
 
@@ -189,18 +203,62 @@ echo_done:
  *  export -p       — bash-style declaration list
  *  export -n NAME  — keep NAME but remove its exported attribute
  * ================================================================ */
+/* Render one exported variable the way bash's `export -p` does:
+ *     declare -x NAME="value"
+ *     declare -x NAME          (for `export NAME` with no value)
+ * Two details matter, because scripts routinely do
+ *     eval "$(export -p)"
+ * to re-create an environment:
+ *   - a variable that exists but was never given a value must not grow an
+ *     empty `=""`, or the replay would define it where bash left it merely
+ *     declared;
+ *   - `"` and `\` inside the value must be escaped, or a value such as
+ *     `a"b` would terminate the quoting early and the replay would fail
+ *     with a syntax error (besh used to emit it raw). */
+static void print_export_one(const Var *v) {
+    printf("declare -x %s", v->name);
+    if (v->value) {
+        putchar('=');
+        putchar('"');
+        for (const char *p = v->value; *p; p++) {
+            if (*p == '"' || *p == '\\' || *p == '`' || *p == '$')
+                putchar('\\');
+            putchar(*p);
+        }
+        putchar('"');
+    }
+    printf("\n");
+}
+
+/* Is this a name we should ever offer to the outside world?
+ *
+ * The `$`, `?`, `#`, `0`, `-` … entries are read-only pseudo-variables the
+ * expander keeps in the same table for uniform lookup.  bash never prints
+ * them from `export -p`, `declare -p` or `set`, and emitting
+ * `declare -x $="290575"` produced output that no shell can parse back. */
+static int var_is_pseudo(const char *name) {
+    if (!name || !name[0]) return 1;
+    if (!name[1]) {
+        switch (name[0]) {
+        case '$': case '?': case '#': case '!': case '-':
+        case '*': case '@': case '_': case '0' ... '9':
+            return 1;
+        }
+    }
+    /* array element bookkeeping: `a__0`, `a__1`, … live in the table too */
+    size_t n = strlen(name);
+    if (n > 2 && name[n - 2] == '_' && name[n - 1] == '_') return 1;
+    return 0;
+}
+
 int builtin_export(int argc, char **argv) {
     Shell *sh = shell_get();
 
     if (argc == 1) {
         /* print all exported variables */
         for (int i = 0; i < sh->nvars; i++) {
-            if (sh->vars[i].exported) {
-                printf("declare -x %s", sh->vars[i].name);
-                if (sh->vars[i].value && *sh->vars[i].value)
-                    printf("=\"%s\"", sh->vars[i].value);
-                printf("\n");
-            }
+            if (sh->vars[i].exported && !var_is_pseudo(sh->vars[i].name))
+                print_export_one(&sh->vars[i]);
         }
         return 0;
     }
@@ -209,11 +267,13 @@ int builtin_export(int argc, char **argv) {
     int i = 1;
     for (; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0) {
-            for (int j = 0; j < sh->nvars; j++) {
-                if (sh->vars[j].exported)
-                    printf("export %s=\"%s\"\n", sh->vars[j].name,
-                           sh->vars[j].value ? sh->vars[j].value : "");
-            }
+            /* Same rendering as bare `export`: bash prints `declare -x
+             * NAME="value"` in both cases, and scripts routinely do
+             *     eval "$(export -p)"
+             * to re-create an environment.  `export NAME="value"` happens
+             * to re-export correctly too, but the format must match. */
+            for (int j = 0; j < sh->nvars; j++)
+                print_export_one(&sh->vars[j]);
             return 0;
         }
         if (strcmp(argv[i], "-n") == 0) { unexport = 1; continue; }
@@ -1195,6 +1255,30 @@ int builtin_history(int argc, char **argv) {
         if (strcmp(argv[i], "-a") == 0) { history_append(); return 0; }
         if (strcmp(argv[i], "-r") == 0) { history_read(); return 0; }
         if (strcmp(argv[i], "-w") == 0) { history_write(); return 0; }
+        /* `history -s word ...` — append the words to the history without
+         * running them.  bash joins them with a space into one entry, and
+         * HISTIGNORE still applies (the append goes through the same
+         * history_add() the line editor uses). */
+        if (strcmp(argv[i], "-s") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "besh: history: -s: option requires an argument\n");
+                return 1;
+            }
+            size_t need = 1;
+            for (int a = i + 1; a < argc; a++) need += strlen(argv[a]) + 1;
+            char *joined = sh_malloc(need);
+            size_t at = 0;
+            for (int a = i + 1; a < argc; a++) {
+                if (a > i + 1) joined[at++] = ' ';
+                size_t nl = strlen(argv[a]);
+                memcpy(joined + at, argv[a], nl);
+                at += nl;
+            }
+            joined[at] = '\0';
+            history_add(joined);
+            free(joined);
+            return 0;
+        }
         if (strcmp(argv[i], "-d") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "besh: history: -d: option requires an argument\n");
@@ -1588,7 +1672,12 @@ static void gen_files(CandList *l, const char *prefix, int dirs_only) {
         struct stat st;
         int isdir = (stat(full, &st) == 0 && S_ISDIR(st.st_mode));
         if (dirs_only && !isdir) continue;
-        char cand[MAX_PATH + 4];
+        /* `lead` is a path fragment and d_name can be up to 255 bytes, so
+         * the buffer has to be able to hold both plus the trailing slash.
+         * Sizing it as MAX_PATH alone made -Wformat-truncation (surfaced
+         * by the sanitizer build's analysis) complain about a possible
+         * silent truncation. */
+        char cand[MAX_PATH + NAME_MAX + 4];
         snprintf(cand, sizeof(cand), "%s%s%s", lead, e->d_name, isdir ? "/" : "");
         cand_add_unique(l, cand);
     }
@@ -1955,7 +2044,11 @@ int builtin_read(int argc, char **argv) {
         fflush(stderr);
     }
 
-    char buf[MAX_LINE];
+    /* The line buffer grows on demand.  A fixed 64 KiB buffer silently
+     * dropped everything past the limit, so `read x < bigfile` handed the
+     * script a truncated line while bash returned all 200 KB of it. */
+    size_t bcap = 4096;
+    char *buf = sh_malloc(bcap);
     int read_timed_out = 0;
     /* Read straight from fd 0 rather than through the stdio `stdin`
      * buffer.  Redirections are installed with dup2() behind stdio's
@@ -1967,21 +2060,57 @@ int builtin_read(int argc, char **argv) {
         size_t n = 0;
         int got_any = 0;
         int timed_out = 0;
-        while (n < sizeof(buf) - 1) {
+        /* Absolute deadline for -t.  Recomputing the timeval from the full
+         * timeout on every EINTR (restart) would let a stream of signals
+         * push the deadline out forever, so the remaining time is derived
+         * from this fixed point instead. */
+        struct timeval deadline = { 0, 0 };
+        if (timeout >= 0.0) {
+            if (gettimeofday(&deadline, NULL) == 0) {
+                deadline.tv_sec  += (time_t)timeout;
+                deadline.tv_usec += (suseconds_t)((timeout - (double)(time_t)timeout) * 1e6);
+                if (deadline.tv_usec >= 1000000) {
+                    deadline.tv_usec -= 1000000;
+                    deadline.tv_sec  += 1;
+                }
+            }
+        }
+        while (1) {
+            if (n + 1 >= bcap) {           /* keep room for the NUL */
+                bcap *= 2;
+                buf = sh_realloc(buf, bcap);
+            }
             /* With -t, wait for readability before each byte so the whole
              * read can be abandoned.  bash reports status > 128 and leaves
              * the variable empty when the timeout fires before any input. */
             if (timeout >= 0.0 && !got_any) {
                 fd_set rfds;
-                struct timeval tv;
+                struct timeval tv, now;
                 FD_ZERO(&rfds);
                 FD_SET(STDIN_FILENO, &rfds);
-                tv.tv_sec  = (time_t)timeout;
-                tv.tv_usec = (suseconds_t)((timeout - (double)tv.tv_sec) * 1e6);
+                if (gettimeofday(&now, NULL) == 0) {
+                    tv.tv_sec  = deadline.tv_sec  - now.tv_sec;
+                    tv.tv_usec = deadline.tv_usec - now.tv_usec;
+                    if (tv.tv_usec < 0) { tv.tv_usec += 1000000; tv.tv_sec -= 1; }
+                } else {
+                    tv.tv_sec  = (time_t)timeout;
+                    tv.tv_usec = (suseconds_t)((timeout - (double)(time_t)timeout) * 1e6);
+                }
+                if (tv.tv_sec < 0) { timed_out = 1; break; }
                 int s = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
                 if (s == 0) { timed_out = 1; break; }
                 if (s < 0 && errno != EINTR) break;
-                if (s < 0) continue;            /* EINTR → retry */
+                if (s < 0) {
+                    /* EINTR: loop and recompute against the same deadline */
+                    if (timeout >= 0.0 && gettimeofday(&now, NULL) == 0 &&
+                        (now.tv_sec > deadline.tv_sec ||
+                         (now.tv_sec == deadline.tv_sec &&
+                          now.tv_usec >= deadline.tv_usec))) {
+                        timed_out = 1;
+                        break;
+                    }
+                    continue;
+                }
             }
             char ch;
             ssize_t r = read(STDIN_FILENO, &ch, 1);
@@ -2000,6 +2129,7 @@ int builtin_read(int argc, char **argv) {
             read_timed_out = 1;
             buf[0] = '\0';
         } else if (!got_any) {
+            free(buf);
             return 1;                       /* EOF, nothing read */
         }
         buf[n] = '\0';
@@ -2012,8 +2142,8 @@ int builtin_read(int argc, char **argv) {
 
     if (!raw) {
         /* fold \<newline> continuations and strip unescaped backslashes */
-        char out[MAX_LINE];
-        int o = 0;
+        char *out = sh_malloc(len + 1);
+        size_t o = 0;
         for (size_t k = 0; k < len; k++) {
             if (buf[k] == '\\' && k + 1 < len && buf[k+1] == '\n') { k++; continue; }
             out[o++] = buf[k];
@@ -2021,11 +2151,13 @@ int builtin_read(int argc, char **argv) {
         out[o] = '\0';
         len = o;
         memcpy(buf, out, o + 1);
+        free(out);
     }
 
     if (i >= argc) {
         /* no variable given → REPLY */
         sh_setenv("REPLY", buf, 0);
+        free(buf);
         return read_timed_out ? 142 : 0;
     }
 
@@ -2039,31 +2171,66 @@ int builtin_read(int argc, char **argv) {
         if (strchr(ifs, ' ')) { sep[0] = ' '; sep[1] = '\t'; sep[2] = '\0'; }
     }
 
-    char *tokens[MAX_LINE];
-    int ntok = 0;
-    char *save = NULL;
-    char *tok = strtok_r(buf, sep, &save);
-    while (tok && ntok < MAX_LINE) {
-        tokens[ntok++] = tok;
-        tok = strtok_r(NULL, sep, &save);
+    /* Split into fields without touching the line at all.
+     *
+     * `tokens` used to be a `char *tokens[MAX_LINE]` on the stack — a full
+     * 512 KiB of frame for a builtin that usually needs a handful of
+     * entries, and still a hard cap.  The array is now heap-allocated.
+     *
+     * strtok_r() cannot be used here: it overwrites each separator with a
+     * NUL, so the last variable could not recover "the rest of the line"
+     * (`read a b` on `x y z` must give b="y z").  Rejoining the split
+     * fields with a single space lost the original runs of whitespace, and
+     * the 64 KiB token cap dropped everything past it.  Copy each field
+     * out instead, and keep the verbatim tail for the final variable. */
+    char **tokens = NULL;
+    int ntok = 0, tcap = 0;
+    /* rest_of[k] is where field k starts, so the last variable can be
+     * handed everything from field `nvars-1` onward.  bash adds the
+     * separators *inside* that span back verbatim ("x y z  w" with
+     * `read a b c` gives c="z  w"), which is why the slice comes from the
+     * original buffer rather than a re-joined list of fields. */
+    const char **rest_of = NULL;
+    {
+        const char *p = buf;
+        while (*p) {
+            while (*p && strchr(sep, *p)) p++;      /* skip separators */
+            if (!*p) break;
+            const char *fstart = p;
+            while (*p && !strchr(sep, *p)) p++;     /* skip the field */
+            if (ntok == tcap) {
+                tcap = tcap ? tcap * 2 : 32;
+                tokens  = sh_realloc(tokens,  tcap * sizeof(char *));
+                rest_of = sh_realloc(rest_of, tcap * sizeof(char *));
+            }
+            tokens[ntok]  = sh_strndup(fstart, p - fstart);
+            rest_of[ntok] = fstart;
+            ntok++;
+        }
     }
 
     int v;
     for (v = 0; v < nvars; v++) {
-        if (v < ntok - 1) {
-            sh_setenv(argv[i + v], tokens[v], 0);
-        } else if (v == nvars - 1) {
-            /* last variable gets the remainder */
-            char joined[MAX_LINE] = "";
-            for (int k = v; k < ntok; k++) {
-                if (k > v) strcat(joined, " ");
-                strncat(joined, tokens[k], MAX_LINE - strlen(joined) - 1);
-            }
-            sh_setenv(argv[i + v], joined, 0);
+        if (v < nvars - 1) {
+            sh_setenv(argv[i + v], v < ntok ? tokens[v] : "", 0);
         } else {
-            sh_setenv(argv[i + v], "", 0);
+            /* One name: the whole line.  Otherwise the line from the
+             * (nvars-1)-th field onward, i.e. everything the first
+             * nvars-1 names did not take, with its original separators. */
+            char *tail;
+            if (nvars == 1)          tail = sh_strdup(buf);
+            else if (ntok >= nvars)  tail = sh_strdup(rest_of[nvars - 1]);
+            else                     tail = sh_strdup("");
+            size_t tl = strlen(tail);
+            while (tl > 0 && strchr(sep, tail[tl-1])) tail[--tl] = '\0';
+            sh_setenv(argv[i + v], tail, 0);
+            free(tail);
         }
     }
+    for (int k = 0; k < ntok; k++) free(tokens[k]);
+    free(tokens);
+    free(rest_of);
+    free(buf);
     /* bash uses >128 to signal "the timeout expired"; the variables have
      * still been assigned (empty), so `read -t 1 x || echo timeout` works. */
     return read_timed_out ? 142 : 0;
@@ -2442,15 +2609,81 @@ int builtin_exec(int argc, char **argv) {
  *  wait [pid]  — wait for background processes
  * ================================================================ */
 int builtin_wait(int argc, char **argv) {
-    (void)argc; (void)argv;
-    int status;
-    pid_t pid;
-    int ret = 0;
-    while ((pid = waitpid(-1, &status, 0)) > 0) {
-        if (WIFEXITED(status))
-            ret = WEXITSTATUS(status);
-    }
     Shell *sh = shell_get();
+
+    /* `wait` with no operand waits for every child and reports 0 — bash
+     * semantics, and the previous implementation relied on that.  With
+     * operands it must collect exactly the named jobs and report the
+     * status of the *last* one, so that
+     *     sleep 100 & p=$!; kill -15 $p; wait $p; echo $?
+     * prints 143.  Returning 0 there was wrong: it hid the fact that the
+     * job had been killed. */
+    if (argc <= 1) {
+        /* Drain every child.  bash reports 0 here regardless of how the
+         * individual jobs ended — `wait` with no operand is "wait for
+         * everything", not "report the last one".  (Collecting statuses
+         * into `ret` made `( exit 7 ) & wait` print 7.) */
+        int status;
+        pid_t pid;
+        while ((pid = waitpid(-1, &status, 0)) > 0) {
+            /* keep the job table in step so `$!` and a later `wait pid`
+             * do not refer to a process nothing is tracking any more */
+            int stopped = 0;
+            (void)stopped;
+            job_update(pid, status);
+            job_remove(pid);
+        }
+        sh->exit_status = 0;
+        return 0;
+    }
+
+    int ret = 0;
+    for (int a = 1; a < argc; a++) {
+        const char *arg = argv[a];
+
+        /* `%n` / `%?str` job specifiers */
+        if (arg[0] == '%') {
+            Job *j = NULL;
+            if (arg[1] == '%' || arg[1] == '+') {
+                for (Job *it = sh->jobs; it; it = it->next) j = it; /* newest */
+            } else if (arg[1] >= '0' && arg[1] <= '9') {
+                j = job_find_by_id(atoi(arg + 1));
+            } else if (arg[1] == '?') {
+                for (Job *it = sh->jobs; it; it = it->next)
+                    if (strstr(it->command, arg + 2)) { j = it; break; }
+            }
+            if (!j) {
+                fprintf(stderr, "besh: wait: %s: no such job\n", arg);
+                ret = 127;
+                continue;
+            }
+            int stopped = 0;
+            for (int i = 0; i < j->npids; i++) {
+                if (j->pids[i] <= 0) continue;
+                int st = job_reap_pid(j->pids[i], &stopped);
+                if (st >= 0) ret = st;
+            }
+            if (!stopped) job_remove(j->pgid);
+            continue;
+        }
+
+        char *end;
+        long v = strtol(arg, &end, 10);
+        if (*end != '\0' || v <= 0) {
+            fprintf(stderr, "besh: wait: %s: not a pid or valid job spec\n", arg);
+            ret = 2;
+            continue;
+        }
+        pid_t pid = (pid_t)v;
+        int stopped = 0;
+        int st = job_reap_pid(pid, &stopped);
+        if (st < 0) {
+            fprintf(stderr, "besh: wait: pid %ld is not a child of this shell\n", v);
+            ret = 127;
+        } else {
+            ret = st;
+        }
+    }
     sh->exit_status = ret;
     return ret;
 }
@@ -2509,14 +2742,157 @@ int builtin_times(int argc, char **argv) {
 /* ================================================================
  *  trap [action] [signal...]  — set signal handlers
  * ================================================================ */
+/* ================================================================
+ *  trap [action] [signal...]  — set signal handlers
+ *
+ *  Forms (bash-compatible subset):
+ *      trap 'cmd' INT TERM     install the action
+ *      trap '' INT             ignore the signal
+ *      trap - INT              restore default handling
+ *      trap INT                same as `trap - INT` in bash
+ *      trap                    list all traps
+ *      trap -l                 list signal names and numbers
+ *
+ *  The action runs at a safe point (between commands), not inside the
+ *  signal handler — see trap_handler() in main.c.
+ *
+ *  Limitations kept deliberately: EXIT/ERR/DEBUG/RETURN pseudo-signals
+ *  are not implemented, so `trap 'x' EXIT` reports an error rather than
+ *  silently doing nothing (silence was the old behaviour and it hid real
+ *  bugs).  SIGKILL/SIGSTOP cannot be caught and are rejected like bash's.
+ * ================================================================ */
+static const char *trap_sig_name(int sig) {
+    switch (sig) {
+    case SIGHUP:   return "HUP";   case SIGINT:   return "INT";
+    case SIGQUIT:  return "QUIT";  case SIGILL:   return "ILL";
+    case SIGTRAP:  return "TRAP";  case SIGABRT:  return "ABRT";
+    case SIGBUS:   return "BUS";   case SIGFPE:   return "FPE";
+    case SIGKILL:  return "KILL";  case SIGUSR1:  return "USR1";
+    case SIGSEGV:  return "SEGV";  case SIGUSR2:  return "USR2";
+    case SIGPIPE:  return "PIPE";  case SIGALRM:  return "ALRM";
+    case SIGTERM:  return "TERM";  case SIGCHLD:  return "CHLD";
+    case SIGCONT:  return "CONT";  case SIGSTOP:  return "STOP";
+    case SIGTSTP:  return "TSTP";  case SIGTTIN:  return "TTIN";
+    case SIGTTOU:  return "TTOU";  case SIGWINCH: return "WINCH";
+    }
+    return NULL;
+}
+
 int builtin_trap(int argc, char **argv) {
-    (void)argc; (void)argv;
-    if (argc == 1) {
-        /* list traps */
+    Shell *sh = shell_get();
+    /* no leading index needed: operands are handled below */
+
+    /* `trap -l` — the same table bash prints, sorted the same way */
+    if (argc == 2 && strcmp(argv[1], "-l") == 0) {
+        int col = 0;
+        for (int s = 1; s < NSIG; s++) {
+            const char *nm = trap_sig_name(s);
+            if (!nm) continue;
+            printf("%2d) SIG%-8s", s, nm);
+            if (++col == 4) { putchar('\n'); col = 0; }
+        }
+        if (col) putchar('\n');
         return 0;
     }
-    /* simplified — not fully implemented */
-    return 0;
+
+    if (argc == 1) {
+        /* list installed traps; bash prints them as `trap -- 'action' SIG` */
+        int any = 0;
+        for (int s = 1; s < NSIG; s++) {
+            const char *a = trap_get(s);
+            if (!a) continue;
+            const char *nm = trap_sig_name(s);
+            if (!nm) continue;
+            if (*a == '\0') printf("trap -- '' SIG%s\n", nm);
+            else            printf("trap -- '%s' SIG%s\n", a, nm);
+            any = 1;
+        }
+        return any ? 0 : 0;
+    }
+
+    /* Determine whether the first operand is the action or a signal list.
+     * bash decides by checking if it names a signal: `trap INT` therefore
+     * means "reset INT", while `trap - INT` and `trap 'x' INT` install. */
+    const char *action = NULL;
+    int rest = 1;
+    int print_only = 0;
+
+    if (strcmp(argv[1], "-p") == 0) {
+        print_only = 1;
+        if (argc == 2) {                  /* `trap -p` lists everything */
+            for (int s = 1; s < NSIG; s++) {
+                const char *a = trap_get(s);
+                const char *nm = trap_sig_name(s);
+                if (!a || !nm) continue;
+                if (*a == '\0') printf("trap -- '' SIG%s\n", nm);
+                else            printf("trap -- '%s' SIG%s\n", a, nm);
+            }
+            return 0;
+        }
+        rest = 2;
+    } else if (strcmp(argv[1], "-") == 0) {
+        action = NULL;              /* reset */
+        rest = 2;
+    } else if (trap_signal_number(argv[1]) > 0) {
+        /* first word is a signal name → reset those signals */
+        action = NULL;
+        rest = 1;
+    } else {
+        action = argv[1];
+        rest = 2;
+        if (rest >= argc) {
+            fprintf(stderr, "besh: trap: usage: trap [-lp] [[action] signal ...]\n");
+            return 2;   /* bash uses 2 for a usage error */
+        }
+    }
+
+    int status = 0;
+    for (; rest < argc; rest++) {
+        /* The pseudo-signals bash also accepts here.  They are not
+         * implemented, and pretending otherwise is worse than saying so:
+         * `trap 'cleanup' EXIT` used to be accepted silently and then
+         * never run, so a script's cleanup step just vanished. */
+        if (strcmp(argv[rest], "EXIT") == 0 || strcmp(argv[rest], "SIGEXIT") == 0 ||
+            strcmp(argv[rest], "ERR") == 0 || strcmp(argv[rest], "DEBUG") == 0 ||
+            strcmp(argv[rest], "RETURN") == 0) {
+            fprintf(stderr, "besh: trap: %s: this pseudo-signal is not supported\n",
+                    argv[rest]);
+            status = 1;
+            continue;
+        }
+        int sig = trap_signal_number(argv[rest]);
+        if (sig <= 0) {
+            fprintf(stderr, "besh: trap: %s: invalid signal specification\n",
+                    argv[rest]);
+            status = 1;
+            continue;
+        }
+        if (sig == SIGKILL || sig == SIGSTOP) {
+            fprintf(stderr, "besh: trap: %s: cannot be caught or ignored\n",
+                    argv[rest]);
+            status = 1;
+            continue;
+        }
+        if (print_only) {
+            const char *a = trap_get(sig);
+            const char *nm = trap_sig_name(sig);
+            if (a && nm) {
+                if (*a == '\0') printf("trap -- '' SIG%s\n", nm);
+                else            printf("trap -- '%s' SIG%s\n", a, nm);
+            }
+            continue;
+        }
+        trap_set(sig, action);
+
+        /* Installing an INT trap means the interactive handler must go:
+         * otherwise Ctrl-C would redraw the prompt and never fire the
+         * action.  Clearing it puts the line-editor behaviour back. */
+        if (sig == SIGINT) {
+            if (action) signal(SIGINT, trap_handler);
+            else if (sh->job_interactive) signal(SIGINT, sigint_handler);
+        }
+    }
+    return status;
 }
 
 /* ================================================================

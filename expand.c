@@ -120,6 +120,19 @@ static char *join_positional(void) {
     return r;
 }
 
+/* The pid `$!` / `${!}` must report: the most recent background job that
+ * still has a live process.  job_add() pushes at the head, so the first
+ * usable entry wins.  Kept in one place because the two spellings are
+ * expanded by two different functions and used to drift apart. */
+static pid_t last_bg_pid(void) {
+    Shell *sh = shell_get();
+    for (Job *j = sh->jobs; j; j = j->next) {
+        for (int k = j->npids - 1; k >= 0; k--)
+            if (j->pids[k] > 0) return j->pids[k];
+    }
+    return 0;
+}
+
 /* value of a parameter by name; *is_set is 0 when the parameter is unset */
 static char *param_get(const char *name, int *is_set) {
     Shell *sh = shell_get();
@@ -131,7 +144,7 @@ static char *param_get(const char *name, int *is_set) {
         switch (name[0]) {
         case '*': case '@': return join_positional();
         case '?': snprintf(buf, sizeof(buf), "%d", sh->exit_status); return sh_strdup(buf);
-        case '$': snprintf(buf, sizeof(buf), "%d", getpid());        return sh_strdup(buf);
+        case '$': snprintf(buf, sizeof(buf), "%d", (int)sh->shell_pid);        return sh_strdup(buf);
         case '#': snprintf(buf, sizeof(buf), "%d", sh->npositional);  return sh_strdup(buf);
         case '-': {   /* current option flags, bash-compatible ordering */
             char o[24]; int k = 0;
@@ -147,10 +160,9 @@ static char *param_get(const char *name, int *is_set) {
             return sh_strdup(o);
         }
         case '!': {
-            pid_t lp = 0;
-            for (Job *j = sh->jobs; j; j = j->next)
-                if (j->npids > 0) lp = j->pids[j->npids - 1];
-            snprintf(buf, sizeof(buf), "%d", lp);
+            /* `${!}` reaches this one; `$!` goes through var_expand_one().
+             * Both call last_bg_pid() so they cannot disagree. */
+            snprintf(buf, sizeof(buf), "%d", (int)last_bg_pid());
             return sh_strdup(buf);
         }
         default: break;
@@ -387,7 +399,7 @@ static char *expand_braced(const char **pp) {
             if (nl == 0 || rst[0] != '\0') {
                 fprintf(stderr, "besh: ${#%s}: bad substitution\n", op);
                 sh->exit_status = 1;
-                if (!sh->job_interactive) exit(1);
+                if (!sh->job_interactive) shell_fatal(1);
                 result = sh_strdup("");
                 goto done;
             }
@@ -443,18 +455,25 @@ static char *expand_braced(const char **pp) {
                 /* indirect through an unset variable — bash reports an error */
                 fprintf(stderr, "besh: %s: invalid indirect expansion\n", op);
                 sh->exit_status = 1;
-                if (!sh->job_interactive) exit(1);
+                if (!sh->job_interactive) shell_fatal(1);
                 result = sh_strdup("");
             } else if (!is_valid_name(inner)) {
                 fprintf(stderr, "besh: %s: invalid indirect expansion\n", inner);
                 sh->exit_status = 1;
-                if (!sh->job_interactive) exit(1);
+                if (!sh->job_interactive) shell_fatal(1);
                 result = sh_strdup("");
             } else {
                 char *v = sh_getenv(inner);
                 result = sh_strdup(v ? v : "");
             }
         } else {
+            /* The operand after `!` is not a plain name — `${!x$y}`,
+             * `${!a-b}` and friends.  bash calls this a bad substitution
+             * and aborts; silently yielding "" (as this used to) turned a
+             * syntax error into an empty value and hid the bug. */
+            fprintf(stderr, "besh: ${!%s}: bad substitution\n", op);
+            sh->exit_status = 1;
+            if (!sh->job_interactive) shell_fatal(1);
             result = sh_strdup("");
         }
         goto done;
@@ -534,7 +553,7 @@ static char *expand_braced(const char **pp) {
                             *earg ? earg : "parameter null or not set");
                     free(earg); free(val);
                     sh->exit_status = 1;
-                    if (!sh->job_interactive) exit(1);
+                    if (!sh->job_interactive) shell_fatal(1);
                     result = sh_strdup("");
                 } else { result = val; free(earg); }
                 break;
@@ -546,7 +565,7 @@ static char *expand_braced(const char **pp) {
     /* ${v#pat} ${v##pat} — strip shortest/longest matching prefix */
     if (rest[0] == '#') {
         int longest = (rest[1] == '#');
-        char *pat = unescape_word(expand_string(rest + (longest ? 2 : 1)));
+        char *pat = expand_string_no_split(rest + (longest ? 2 : 1));
         int set;
         char *val = param_get(name, &set);
         size_t len = strlen(val), cut = 0;
@@ -567,7 +586,7 @@ static char *expand_braced(const char **pp) {
     /* ${v%pat} ${v%%pat} — strip shortest/longest matching suffix */
     if (rest[0] == '%') {
         int longest = (rest[1] == '%');
-        char *pat = unescape_word(expand_string(rest + (longest ? 2 : 1)));
+        char *pat = expand_string_no_split(rest + (longest ? 2 : 1));
         int set;
         char *val = param_get(name, &set);
         size_t len = strlen(val), st = len;
@@ -599,7 +618,7 @@ static char *expand_braced(const char **pp) {
         }
         char *patraw = slash ? sh_strndup(r, slash - r) : sh_strdup(r);
         char *repraw = slash ? sh_strdup(slash + 1) : sh_strdup("");
-        char *pat = unescape_word(expand_string(patraw));
+        char *pat = expand_string_no_split(patraw);
         char *rep = expand_string(repraw);
         int set;
         char *val = param_get(name, &set);
@@ -613,7 +632,7 @@ static char *expand_braced(const char **pp) {
         int upper = (rest[0] == '^');
         int all = (rest[1] == rest[0]);
         const char *pr = rest + (all ? 2 : 1);
-        char *pat = *pr ? unescape_word(expand_string(pr)) : NULL;
+        char *pat = *pr ? expand_string_no_split(pr) : NULL;
         int set;
         char *val = param_get(name, &set);
         result = case_convert(val, upper, all, pat);
@@ -780,17 +799,15 @@ static char *var_expand_one(const char **pp) {
     }
     if (*p == '$') {
         char buf[32];
-        snprintf(buf, sizeof(buf), "%d", getpid());
+        snprintf(buf, sizeof(buf), "%d", (int)sh->shell_pid);
         *pp = p + 1;
         return sh_strdup(buf);
     }
     if (*p == '!') {
         char buf[32];
-        /* last background pid — find most recent job */
-        pid_t last_pid = 0;
-        for (Job *j = sh->jobs; j; j = j->next)
-            if (j->npids > 0) last_pid = j->pids[j->npids - 1];
-        snprintf(buf, sizeof(buf), "%d", last_pid);
+        /* `$!` — the pid of the most recent background job.  See
+         * last_bg_pid(); `${!}` uses the same helper via param_get(). */
+        snprintf(buf, sizeof(buf), "%d", (int)last_bg_pid());
         *pp = p + 1;
         return sh_strdup(buf);
     }
@@ -918,8 +935,15 @@ static char *command_substitute(const char *cmd) {
         sh->jobs = NULL;
         sh->njob = 0;
         sh->job_interactive = 0;
-        fflush(NULL);   /* _exit skips stdio flush */
-        _exit(execute_string(cmd));
+        /* _exit() skips stdio flushing, so the flush has to happen *after*
+         * the substituted command has produced its output.  Doing it before
+         * (as this used to) flushed the parent's buffers — which the child
+         * had just inherited — and left the child's own output, e.g. that
+         * of the `pwd` builtin, to be discarded: `$(pwd)` came back empty
+         * while the same command redirected to a file worked. */
+        int sub_status = execute_string(cmd);
+        fflush(NULL);
+        _exit(sub_status);
     }
 
     /* parent */
@@ -928,7 +952,16 @@ static char *command_substitute(const char *cmd) {
     int rlen = 0, rcap = 256;
     char rbuf[4096];
     ssize_t n;
-    while ((n = read(pipefd[0], rbuf, sizeof(rbuf))) > 0) {
+    /* read() returns -1/EINTR when a signal (SIGCHLD, SIGWINCH, a trap)
+     * arrives mid-way.  Treating that as end-of-input truncated the
+     * substitution — a half-written result with no error — so retry. */
+    while (1) {
+        n = read(pipefd[0], rbuf, sizeof(rbuf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
         while (rlen + n + 1 >= rcap) { rcap *= 2; result = sh_realloc(result, rcap); }
         memcpy(result + rlen, rbuf, n);
         rlen += n;
@@ -937,7 +970,8 @@ static char *command_substitute(const char *cmd) {
     result[rlen] = '\0';
 
     int status;
-    waitpid(pid, &status, 0);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+        ;   /* a signal must not leave the child unreaped */
 
     /* strip trailing newlines */
     while (rlen > 0 && result[rlen-1] == '\n') result[--rlen] = '\0';
@@ -1765,15 +1799,29 @@ static void expand_array_token(Shell *sh, const char *tok, int q,
                 append_str(&cur, &clen, &ccap, vals[i]);
             }
         } else {
-            /* ${a[@]} — one word per element */
+            /* ${a[@]} — one word per element.
+             *
+             * The prefix accumulated in `cur` belongs to the *first*
+             * element only; the suffix that follows the substitution
+             * belongs to the last one.  A previous version reset `cur`
+             * before the last element, which threw the prefix away
+             * whenever the array held exactly one element:
+             *
+             *     a=(only); echo "x${a[@]}y"    # printed "onlyy"
+             *
+             * bash prints "xonlyy".  So: emit each element but the last as
+             * its own field, prefixing only the first with `cur`; hand the
+             * last element to `cur` (prefix included) so the trailing
+             * text can be appended to it by the caller. */
             for (int i = 0; i < ne; i++) {
                 if (i < ne - 1) {
-                    char *w = sh_malloc(strlen(cur) + strlen(vals[i]) + 1);
-                    sprintf(w, "%s%s", cur, vals[i]);
-                    clen = 0; cur[0] = '\0';
+                    const char *pre = (i == 0) ? cur : "";
+                    char *w = sh_malloc(strlen(pre) + strlen(vals[i]) + 1);
+                    sprintf(w, "%s%s", pre, vals[i]);
+                    if (i == 0) { clen = 0; cur[0] = '\0'; }
                     emit_field(sh, result, nresult, w, q);
                 } else {
-                    clen = 0; cur[0] = '\0';
+                    /* last element: keep whatever prefix is still pending */
                     append_str(&cur, &clen, &ccap, vals[i]);
                     force_last = 1;
                 }
@@ -1842,6 +1890,10 @@ char **expand_words_q(char **words, int *quoted, int *count) {
         char **segs = NULL;
         int k = split_at_refs(words[i], &segs);
         if (k == 0) {
+            /* No "$@" in this word: the single segment still has to be
+             * released.  Only the array was freed here, so every plain
+             * word that reached this path leaked its copy. */
+            free(segs[0]);
             free(segs);
             add_expanded_words(sh, result, &nresult, expand_string(words[i]), q);
             continue;

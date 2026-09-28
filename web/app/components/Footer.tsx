@@ -17,7 +17,7 @@ export default function Footer() {
           </div>
           <p className="mt-3 max-w-sm font-mono text-xs leading-relaxed text-[color:var(--text-2)]">
             A bash-compatible shell written in C, remixed with fish &amp; zsh.
-            11.7k lines, 44 builtins, zero dependencies.
+            13.2k lines, 44 builtins, zero dependencies.
           </p>
         </div>
 

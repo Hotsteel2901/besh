@@ -19,6 +19,7 @@ Lexer *lexer_new(const char *input) {
     l->token_quoted = 0;
     l->token_escaped = 0;
     l->token_fd = -1;
+    l->syntax_error = 0;
     return l;
 }
 
@@ -305,7 +306,10 @@ static char *read_single_quoted(Lexer *l) {
         l->pos++;
     }
     if (l->pos < l->len) l->pos++;  /* skip closing ' */
-    else fprintf(stderr, "besh: unterminated single-quoted string\n");
+    else {
+        fprintf(stderr, "besh: unterminated single-quoted string\n");
+        l->syntax_error = 1;
+    }
     buf[blen] = '\0';
     return buf;
 }
@@ -434,8 +438,10 @@ static char *read_double_quoted(Lexer *l) {
         l->pos++;
     }
     buf[blen] = '\0';
-    if (!closed)
+    if (!closed) {
         fprintf(stderr, "besh: unterminated double-quoted string\n");
+        l->syntax_error = 1;
+    }
     return buf;
 }
 

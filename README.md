@@ -151,7 +151,7 @@ hint: try: apt install ripgrep
 
 ## 测试
 
-项目自带两套自动化测试，都接入 `make test`：
+项目自带三套自动化测试，都接入 `make test`：
 
 | 套件 | 位置 | 说明 |
 |------|------|------|
@@ -161,8 +161,8 @@ hint: try: apt install ripgrep
 
 ```sh
 make test                 # 全部
-make test-diff            # 差分套件
-make test-interactive     # 交互式套件
+make test-diff            # 差分套件（47 个用例）
+make test-interactive     # 交互式套件（17 项）
 tests/run.sh -v           # 失败时打印 diff
 BESH=./besh tests/run.sh  # 指定被测二进制
 ```
@@ -207,6 +207,8 @@ npm run build                # 静态导出到 web/out（GitHub Pages 部署）
 | `fc`、`compgen`、`command_not_found_handler`、补全脚本未实现 | 均以实现，Tab 已接入可编程补全 |
 | `read -t` 接受参数后静默忽略（退化为阻塞读） | 已实现真正的超时（`select` + 期限），超时返回 142，参数非法即报错 |
 | `${#var#pat}` 静默返回 0 | 与 bash 一致报 `bad substitution`，非交互模式下终止脚本 |
+| `trap` 只有空壳 | 已实现：`trap` / `trap -p` / `trap -l`、`SIG`/纯名字/数字三种写法、多信号、`''` 忽略与 `-` 复位；动作在安全点执行 |
+| `HISTIGNORE` 被文档声称支持但未接 | 已接入 `history_add`，按 `:` 分隔的多条 `fnmatch` 模式生效；`history -s` 一并可用 |
 
 ### 已修复的正确性缺陷
 
@@ -232,15 +234,38 @@ npm run build                # 静态导出到 web/out（GitHub Pages 部署）
 | `fc -s` 自我递归 / `fc -e -1` 选错条目 | REPL 把 `fc -s` 自身写入历史后被重新执行 |
 | `help` 列表与注册表不同步 | 硬编码声称 41 个内建而实际 44 个，改为从注册表生成 |
 | `-O2` 下静默截断 | `prompt_render` 与 `gen_files` 把 `MAX_PATH` 长的串写入同样大小的缓冲；CI 曾用 `-Wno-format-truncation` 掩盖，该开关已移除 |
+| `case` 模式永不展开 | `case $x in $y)` 与 `"$y"` 两种写法都匹配不上任何分支，静默落入 `*)`；现在按 bash 规则区分：未加引号的展开结果仍是通配，加了引号的按字面比较 |
+| `case` 分支超过 64 个被截断 | 第 65 个候选被当成下一分支的模式；模式数组已改为按需增长 |
+| `case` 单词被过度转义 | `case "a*b"` 被展开成字面量 `a\*b`，导致任何含通配符的引号单词都匹配失败 |
+| 内建命令的 heredoc 被忽略 | `while read l; do ...; done < <(...)` 混用、或 `read ... <<EOF` 时正文丢失 |
+| 单元素数组丢失前缀 | `x=a; echo "pre${x[@]}post"` 丢掉了 `pre` |
+| 函数重定义不生效 | 后一个定义被忽略，仍调用旧实现 |
+| 复合命令重定向内存泄漏 | `if ...; fi >f`、`( ... ) 2>&1`、`while ...; done <x` 的重定向结构从不释放 |
+| `>&N` / `2>&N` 内存泄漏 | fd 复制路径上用于回退的 token 副本没有释放 |
+| `read` 大行内存泄漏 | EOF 提前返回与 `REPLY` 路径都漏掉了行缓冲 |
+| 普通单词展开泄漏 | `< word` 不触发拆分时，拆分结果里的那一个分段未释放 |
+| 参数模式展开泄漏 | `${v#pat}` / `${v%pat}` / `${v/pat/rep}` / `${v^}` 的中间展开结果未释放 |
+| 命令替换被信号截断 | `read()` 遇 `EINTR` 被当成读到结尾，结果被截半且无任何报错；现已重试 |
+| 管道内重定向失败仍继续 | `echo hi \| cat > nodir/f` 丢掉了错误并返回 0，现在与 bash 一致地失败 |
+| 非交互模式打出作业控制噪声 | `[1] 12345` / `[1] Done` 在脚本里也会打印，现仅在交互式下输出 |
+| `wait` 无参数返回错误状态 | 返回最后一个作业的状态，应为 0 |
+| 重复 `wait $pid` 返回 127 | 作业已被回收，状态丢失；新增已回收状态环形缓存 |
+| `$!` 报告的是最旧的后台作业 | 两条独立的展开路径各有一份错误实现，现统一 |
+| `$$` 在子 shell / 命令替换中变化 | 应为 shell 生命期内恒定，改用 `Shell.shell_pid` |
+| `read` 在 64 KiB 处截断 | 固定缓冲静默丢弃长行剩余部分；改为按需增长，20 万字符的行也能完整读入 |
+| 未识别的 CSI 序列泄漏到命令行 | 按 Ctrl-左箭头会往输入里粘上 `5D`；现在整条序列读完再分派 |
+| 行编辑器 `~` 补全泄漏 | 路径分段被重新赋值前未释放 |
+| SIGINT 处理函数抹掉输入 | 命令运行期间收到外部 `kill -INT` 会清空尚未提交的编辑内容 |
+| 解析器回退丢状态 | `2>&` 回退时未恢复 `token_fd` / `token_escaped`，后续 `2>` 会继承错误的 fd 前缀 |
 
-## 测试
+## CI 与 sanitizer
 
 ```sh
 make test              # 差分套件 + 交互套件 + 演示
-make test-diff         # 38 个用例，逐个与 bash 对比 stdout+stderr
+make test-diff         # 47 个用例，逐个与 bash 对比 stdout+stderr
 make test-interactive  # 17 个 pty 检查（行编辑器、历史、补全）
 make asan              # 用 ASan + UBSan 重建
-ASAN_OPTIONS=detect_leaks=0 tests/run.sh   # 在 sanitizer 下跑差分套件
+ASAN_OPTIONS=detect_leaks=1 tests/run.sh   # 在 sanitizer 下跑差分套件
 ```
 
 `tests/cases/` 下的每个用例都会同时交给 `bash` 和 `./besh` 执行，
@@ -251,6 +276,10 @@ CI 会以 `-Werror` 构建、跑两个套件，再用 ASan/UBSan 重跑一遍：
 差分测试只能证明 besh 与 bash *输出相同*，看不出「越界写之后恰好
 产生正确字节」的缺陷，而上面表里有两处正是这种情况。
 
+`make asan` 出来的二进制同样带 LeakSanitizer，完整差分套件在
+`detect_leaks=1` 下也是 47/47 通过 —— 内存泄漏会像断言失败一样
+让用例退出码非零，因此每次跑测同时复查一遍全部分配路径。
+
 仍然存在的、有意为之的差异（不打算追平）：
 
 - **`$-` 只列出 besh 实际追踪的选项**（`e f a u v x i C`），
@@ -260,6 +289,10 @@ CI 会以 `-Werror` 构建、跑两个套件，再用 ASan/UBSan 重跑一遍：
   只按 `-W` / `-F` / `-A` 三类来源产生候选
 - `[[ ... ]]` 的 `=~` 使用 POSIX ERE（`regcomp`/`regexec`），
   不支持 bash 的 `BASH_REMATCH` 捕获数组
+- **`trap` 不支持伪信号 `EXIT` / `ERR` / `DEBUG` / `RETURN`**，会明确报错
+  `this pseudo-signal is not supported` 而不是静默接受；真实信号全部可用
+- **`trap 'action' KILL` 返回 1**（bash 返回 0）：SIGKILL 不可捕获，与其
+  装成成功，不如把「这个 trap 永远不会触发」当成错误报出来
 
 日常轻量使用与大多数 shell 脚本都可胜任；遇到依赖上述 bash 特有行为的
 重型脚本，请继续使用 bash/zsh。

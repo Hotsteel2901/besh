@@ -1,0 +1,45 @@
+# An unterminated quote must abort with bash's status 2 and run nothing.
+# bash executes none of the input; the shell used to run the mangled
+# command and exit 0, so a typo looked like success.
+#
+# The malformed here-document delimiter case is also covered in
+# tests/cases/34, where bash itself serves as the reference.
+#
+# run.sh copies this body into a temp directory, so the shell under test
+# is located through BESH if the harness exported it, and otherwise by
+# walking up from the current directory to find the `besh` binary.
+
+if [ -n "${BESH:-}" ] && [ -x "$BESH" ]; then
+    sh_bin="$BESH"
+else
+    d=$(pwd)
+    sh_bin=
+    while [ -n "$d" ] && [ "$d" != "/" ]; do
+        if [ -x "$d/besh" ]; then sh_bin="$d/besh"; break; fi
+        d=$(dirname "$d")
+    done
+    [ -n "$sh_bin" ] || sh_bin=besh
+fi
+
+run() {
+    "$@" > /dev/null 2>&1
+    echo "status=$?"
+}
+
+printf 'echo "unterminated\n' > /tmp/besh_syntax_quote.$$
+run "$sh_bin" /tmp/besh_syntax_quote.$$
+rm -f /tmp/besh_syntax_quote.$$
+
+printf 'cat <<\\"EOF"\nbody\nEOF\n' > /tmp/besh_syntax_hd.$$
+run "$sh_bin" /tmp/besh_syntax_hd.$$
+rm -f /tmp/besh_syntax_hd.$$
+
+# a valid script still runs and reports 0
+printf 'echo fine\n' > /tmp/besh_syntax_ok.$$
+run "$sh_bin" /tmp/besh_syntax_ok.$$
+rm -f /tmp/besh_syntax_ok.$$
+
+--- expect ---
+status=2
+status=2
+status=0

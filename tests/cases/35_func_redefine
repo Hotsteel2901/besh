@@ -1,0 +1,54 @@
+# Regression: function redefinition must take effect, and a definition must
+# only be installed when its statement *executes*.
+#
+# Two bugs lived here:
+#
+#  1. parse_funcdef() registered the function at PARSE time, so the whole
+#     line's definitions existed before any statement ran.  On one line,
+#
+#         h() { echo old; }; unset -f h; h() { echo new; }; h
+#
+#     the parse-time insert was undone by the executed `unset -f`, and the
+#     call printed "command not found" (bash prints `new`).
+#
+#  2. Redefinition appended a second table entry while lookup returned the
+#     first, so `f() { echo 1; }; f() { echo 2; }; f` printed 1.
+
+f() { echo first; }
+f() { echo second; }
+f
+
+# via the `function` keyword too
+function g { echo g1; }
+function g { echo g2; }
+g
+
+# unset -f then redefine, all on one line
+h() { echo old; }
+unset -f h
+h() { echo new; }
+h
+
+# redefinition inside a loop: the last definition wins
+for i in 1 2 3; do
+    k() { echo "v$i"; }
+done
+k
+
+# a definition that only executes conditionally must not exist otherwise
+if false; then
+    never() { echo never; }
+fi
+never 2>/dev/null || echo "not defined"
+
+# define-then-call inside a function body
+outer() {
+    inner() { echo inner-ok; }
+    inner
+}
+outer
+
+# parameters and return still work after redefinition
+r() { echo "old $1"; }
+r() { echo "new $1"; }
+r arg

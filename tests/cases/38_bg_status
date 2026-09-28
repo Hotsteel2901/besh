@@ -1,0 +1,42 @@
+# `$!` and `wait <pid>` were both wrong.
+#
+# `set +m` turns off bash's own job-control chatter ("Killed  sleep 30"),
+# which besh does not reproduce; that message is a bash-only convenience
+# and would otherwise make the two shells' stderr differ for a reason that
+# has nothing to do with the behaviour under test.
+set +m
+#
+# `$!` walked the whole job list and kept assigning, so it reported the
+# *oldest* background job instead of the newest: with `a & p=$!` followed
+# by `b & q=$!`, q held a's pid.  (There were two separate copies of that
+# loop, one for `$!` and one for `${!}`, and only fixing both helped.)
+#
+# `wait <pid>` ignored its operand entirely and returned 0 unless the
+# child had exited normally — so `kill -TERM $p; wait $p` reported success
+# and hid the fact that the job had been killed.
+
+( exit 7 ) & p=$!; wait $p; echo "exit7=$?"
+
+sleep 30 & p=$!; kill -TERM $p; wait $p; echo "term=$?"
+
+# SIGKILL is deliberately not exercised here: bash prints its own
+# "Killed  sleep 30" job-control line for it no matter what, while besh
+# stays quiet.  That difference is bash reporting to its user, not a
+# behavioural divergence, but it makes the streams non-comparable.  The
+# SIGTERM case above already proves that a signal death maps to 128+signo.
+
+# wait with no operand still drains and reports 0
+( sleep 0.05 ) & wait; echo "wait-all=$?"
+
+# a pid that is not our child is an error
+sleep 0.05 & wait 999999 2>/dev/null; echo "bogus=$?"
+
+# waiting on an already-collected job keeps its status
+( exit 3 ) & p=$!; wait $p; wait $p; echo "second-wait=$?"
+
+# a job started inside a pipeline stage reports its own pid
+printf 'a\nb\n' | while read -r l; do
+    ( exit 5 ) & pid=$!
+    wait $pid
+    echo "$l rc=$?"
+done

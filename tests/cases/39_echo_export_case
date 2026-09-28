@@ -1,0 +1,48 @@
+# Three separate defects, all about options and output formats.
+#
+# `echo -ne` : bash accepts clustered single-letter flags, so `-ne` means
+#   "-n -e".  besh compared the whole argument with strcmp against "-n"
+#   and "-e", so a cluster fell through and was printed as literal text.
+#
+# `export -p`: the listing used `export NAME="value"` while bash prints
+#   `declare -x NAME="value"`, and an exported-but-valueless variable was
+#   given an empty `=""`.  Scripts do `eval "$(export -p)"` to re-create
+#   an environment, so both details matter.
+#
+# `case`: the pattern list was capped at 64 alternatives and the joined
+#   pattern at 4 KiB, silently.  A branch past either limit simply never
+#   matched.
+
+echo -ne 'a\tb\n'
+echo -en 'a\tb\n'
+echo -neE 'a\nb'
+echo -nE 'a\tb'
+echo -e -n 'x\n'
+echo -nfoo
+echo -
+echo -- -n
+
+FOO=bar; export FOO
+export -p | grep -E '^declare -x FOO'
+FP='q"r'; export FP
+export -p | grep -E '^declare -x FP'
+
+# a long pattern list must all be usable
+i=0
+pat=
+while [ $i -lt 80 ]; do
+    pat="${pat}p$i|"
+    i=$((i + 1))
+done
+pat="${pat}p79"
+case p79 in
+    $pat) echo long-pattern-list-hit ;;
+    *)    echo long-pattern-list-miss ;;
+esac
+
+# a single very long alternative must match too
+long=$(printf 'a%.0s' $(seq 1 300))
+case "$long" in
+    "$long") echo single-long-alternative-hit ;;
+    *)       echo single-long-alternative-miss ;;
+esac

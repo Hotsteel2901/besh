@@ -1,0 +1,91 @@
+# Regression: here-documents in every syntactic position.
+#
+# The bodies follow the *whole* command line, not the command they are
+# attached to, so a naive reader that grabs the body as soon as it sees
+# `<<EOF` will swallow the rest of a pipeline as document text:
+#
+#     cat <<EOF | wc -c      # the `| wc -c` used to be printed literally
+#     abc
+#     EOF
+#
+# Bodies are now queued during parsing and drained at the line boundary.
+
+# here-document as the only command
+cat <<EOF
+alpha
+EOF
+
+# as the FIRST element of a pipeline
+cat <<EOF | wc -c
+abc
+EOF
+
+# as the LAST element of a pipeline
+echo abc | cat <<EOF
+omega
+EOF
+
+# in the middle of a pipeline
+cat <<EOF | cat | cat
+middle
+EOF
+
+# a command, then a here-document, then another command
+cat <<EOF
+body
+EOF
+echo AFTER
+
+# two here-documents on one line: both bodies are read in order, only the
+# last one feeds stdin
+cat <<A <<B
+1
+A
+2
+B
+
+# three of them
+cat <<A <<B <<C
+1
+A
+2
+B
+3
+C
+
+# here-document feeding a builtin
+read line <<EOF
+read-by-builtin
+EOF
+echo "[$line]"
+
+# a here-document inside a loop body
+for i in 1 2; do
+    cat <<EOF
+iteration $i
+EOF
+done
+
+# expansion still applies in an unquoted body
+V=world
+cat <<EOF
+hello $V
+EOF
+
+# ...and is suppressed for a quoted delimiter
+cat <<'EOF'
+hello $V
+EOF
+
+# A body larger than the 64 KiB pipe buffer must not deadlock.  The body is
+# built by a here-document that itself contains a loop, so the test stays
+# self-contained.
+cat <<OUTER | wc -l
+$( ( i=0; while [ $i -lt 3000 ]; do echo "x$i"; i=$((i+1)); done ) )
+OUTER
+
+# the same through a builtin reader
+read first <<BIG
+$( ( i=0; i=1; echo "first-line" ) )
+BIG
+echo "first=[$first]"

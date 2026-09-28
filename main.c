@@ -564,12 +564,106 @@ char *resolve_path(const char *cmd) {
 
 /* ================================================================
  *  SIGNAL HANDLING
- * ================================================================ */
-static void sigint_handler(int sig) {
+ * ================================================================
+ *
+ *  `trap` needs two halves.  The handler runs asynchronously and may only
+ *  touch async-signal-safe state, so it records the signal number in a
+ *  flag array.  The action itself is a shell command line, and running it
+ *  from inside the handler would re-enter the parser and the allocator at
+ *  an arbitrary point — so the real work happens at safe points, which
+ *  are checked between commands (trap_run_pending, called from
+ *  execute_node_internal) and once per REPL iteration.
+ */
+void trap_handler(int sig) {
+    Shell *sh = shell_get();
+    if (sig > 0 && sig < NSIG && sh->trap_pending)
+        sh->trap_pending[sig] = 1;
+}
+
+/* Record `action` for `sig`.  action==NULL restores the default; an empty
+ * string means "ignore", matching bash's `trap '' SIG`. */
+void trap_set(int sig, const char *action) {
+    Shell *sh = shell_get();
+    if (sig <= 0 || sig >= NSIG) return;
+
+    free(sh->traps[sig]);
+    if (!action) {
+        sh->traps[sig] = NULL;
+        signal(sig, SIG_DFL);
+        return;
+    }
+    sh->traps[sig] = sh_strdup(action);
+    if (*action == '\0') signal(sig, SIG_IGN);
+    else                 signal(sig, trap_handler);
+}
+
+const char *trap_get(int sig) {
+    Shell *sh = shell_get();
+    if (sig <= 0 || sig >= NSIG) return NULL;
+    return sh->traps[sig];
+}
+
+/* Run any actions whose signals have arrived.  Safe to call from normal
+ * (non-signal) context; re-entrant calls are refused because the action
+ * may itself run commands that reach another safe point. */
+void trap_run_pending(void) {
+    Shell *sh = shell_get();
+    if (!sh->trap_pending || sh->in_trap_handler) return;
+
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (!sh->trap_pending[sig]) continue;
+        sh->trap_pending[sig] = 0;
+        const char *action = sh->traps[sig];
+        if (!action || !*action) continue;
+
+        /* SIGINT interrupted the line editor: let the normal Ctrl-C path
+         * redraw instead of running a trap in the middle of an edit. */
+        if (sig == SIGINT && sh->term_in_raw) continue;
+
+        sh->in_trap_handler = 1;
+        int saved = sh->exit_status;
+        execute_string(action);       /* the trap's own `$?` is this one */
+        sh->exit_status = saved;
+        sh->in_trap_handler = 0;
+    }
+}
+
+/* Signal numbers/names accepted by `trap`. */
+int trap_signal_number(const char *name) {
+    if (!name) return -1;
+    if (name[0] >= '0' && name[0] <= '9') {
+        int n = atoi(name);
+        return (n > 0 && n < NSIG) ? n : -1;
+    }
+    /* EXIT is handled separately by the caller */
+    const char *nm = name;
+    if (strncasecmp(nm, "SIG", 3) == 0) nm += 3;
+    struct { const char *n; int s; } tab[] = {
+        {"HUP",SIGHUP},{"INT",SIGINT},{"QUIT",SIGQUIT},{"ILL",SIGILL},
+        {"TRAP",SIGTRAP},{"ABRT",SIGABRT},{"BUS",SIGBUS},{"FPE",SIGFPE},
+        {"KILL",SIGKILL},{"USR1",SIGUSR1},{"SEGV",SIGSEGV},{"USR2",SIGUSR2},
+        {"PIPE",SIGPIPE},{"ALRM",SIGALRM},{"TERM",SIGTERM},{"CHLD",SIGCHLD},
+        {"CONT",SIGCONT},{"STOP",SIGSTOP},{"TSTP",SIGTSTP},{"TTIN",SIGTTIN},
+        {"TTOU",SIGTTOU},{"WINCH",SIGWINCH},
+    };
+    for (size_t i = 0; i < sizeof(tab)/sizeof(tab[0]); i++)
+        if (strcasecmp(nm, tab[i].n) == 0) return tab[i].s;
+    if (strcasecmp(nm, "IOT") == 0)  return SIGABRT;   /* historic alias */
+    if (strcasecmp(nm, "CLD") == 0)  return SIGCHLD;
+    return -1;
+}
+
+void sigint_handler(int sig) {
     (void)sig;
     Shell *sh = shell_get();
     em_write(STDOUT_FILENO, "\n", 1);
-    /* if no foreground job, just redraw prompt */
+    /* Only the line editor owns a half-finished line, and the tty is in raw
+     * mode exactly while it does.  Wiping the edit buffer unconditionally
+     * would also destroy whatever the user had typed whenever a *command*
+     * was interrupted from outside (kill -INT, or Ctrl-C once a foreground
+     * job has taken the terminal back).  A running command restores cooked
+     * mode first, so term_in_raw tells the two cases apart. */
+    if (!sh->term_in_raw) return;
     sh->line_pos = 0;
     sh->line_len = 0;
     sh->line_buf[0] = '\0';
@@ -804,42 +898,53 @@ static int read_key(void) {
     if (b < 0) return 27;     /* bare ESC */
 
     if (b == '[') {
-        /* CSI sequences */
-        int d = read_byte();
-        if (d < 0) return 27;
-        switch (d) {
+        /* CSI sequence: parameters and intermediates (0x20-0x3F) followed
+         * by one final byte (0x40-0x7E).  Collect the whole thing before
+         * deciding, because a wrong guess used to leave the tail of the
+         * sequence in the input queue, where it was inserted into the edit
+         * line as literal text — Ctrl-Left (ESC [ 1 ; 5 D) glued "5D"
+         * into the command.  The digits seen before the final byte are
+         * kept, since `ESC [ 3 ~` and `ESC [ 1 5 ~` both start with a
+         * digit but mean different keys. */
+        int last = -1;
+        char params[16];
+        int np = 0;
+        for (;;) {
+            int d = read_byte();
+            if (d < 0) return -2;
+            if (d >= 0x40 && d < 0x7f) { last = d; break; }   /* final byte */
+            if (np < (int)sizeof(params) - 1) {
+                params[np++] = (char)d;
+                params[np] = '\0';
+            }
+        }
+        switch (last) {
         case 'A': return 256 + 'A';  /* Up    */
         case 'B': return 256 + 'B';  /* Down  */
         case 'C': return 256 + 'C';  /* Right */
         case 'D': return 256 + 'D';  /* Left  */
         case 'H': return 256 + 'H';  /* Home  */
         case 'F': return 256 + 'F';  /* End   */
-        case '3':                    /* Delete */
-        case '5':                    /* PgUp   */
-        case '6':                    /* PgDn   */
-        case '1':                    /* Home (alternate) */
-        case '4':                    /* End (alternate)  */
-        case '7':                    /* Home (urxvt)     */
-        case '8': {                  /* End (urxvt)      */
-            int t = read_byte();
-            if (t != '~') return 27;
-            if (d == '3') return 256 + 127;
-            if (d == '5') return 256 + 'U';
-            if (d == '6') return 256 + 'V';
-            if (d == '1' || d == '7') return 256 + 'H';
-            return 256 + 'F';        /* '4' or '8' */
+        case '~':                    /* the numeric-key forms */
+            if (strcmp(params, "3") == 0) return 256 + 127;  /* Delete */
+            if (strcmp(params, "5") == 0) return 256 + 'U';  /* PgUp   */
+            if (strcmp(params, "6") == 0) return 256 + 'V';  /* PgDn   */
+            if (strcmp(params, "1") == 0 || strcmp(params, "7") == 0)
+                return 256 + 'H';                            /* Home   */
+            if (strcmp(params, "4") == 0 || strcmp(params, "8") == 0)
+                return 256 + 'F';                            /* End    */
+            return -2;
         }
-        }
-        return 27;   /* unrecognised escape, return bare ESC */
+        return -2;   /* recognised, but a key we do not map */
     }
     if (b == 'O') {
         /* SS3 sequences */
         int d = read_byte();
         if (d == 'H') return 256 + 'H';  /* Home */
         if (d == 'F') return 256 + 'F';  /* End  */
-        return 27;
+        return -2;
     }
-    return 27;
+    return -2;   /* ESC-prefixed but unrecognised */
 }
 
 /* ================================================================
@@ -1362,9 +1467,11 @@ static void line_complete(void) {
                 if (s) {
                     *s = '\0';
                     strncpy(dir_path, expanded, MAX_PATH - 1);
+                    free(file_part);            /* was the whole word */
                     file_part = sh_strdup(s + 1);
                 } else {
                     strncpy(dir_path, expanded, MAX_PATH - 1);
+                    free(file_part);
                     file_part = sh_strdup("");
                 }
                 free(expanded);
@@ -1447,6 +1554,7 @@ static int reverse_search(void) {
         em_write(sh->term_fd, buf, pos);
 
         int key = read_key();
+        if (key == -2) continue;   /* unmapped escape: redraw and wait */
 
         if (key == '\r' || key == '\n') {       /* accept */
             em_write(sh->term_fd, "\r\n", 2);
@@ -1520,6 +1628,7 @@ static char *read_line(void) {
 
     for (;;) {
         int key = read_key();
+        if (key == -2) continue;   /* a key we recognise but do not map */
         if (key < 0) { em_write(sh->term_fd, "\r\n", 2); return NULL; }
 
         switch (key) {
@@ -1872,7 +1981,15 @@ int sh_input_incomplete(const char *input) {
                  * syntax error, not a continuation — drop the queue */
                 if (hd_n > hd_head && hd_delim[hd_n - 1][0] == '\0') hd_n = hd_head;
                 cmd_pos = 1; last_op = 0;
-                if (hd_n > hd_head) hd_scan = 1;   /* body starts next line */
+                /* An unterminated quote on the *declaration* line means the
+                 * delimiter itself is malformed (`cat <<\"EOF"`), and bash
+                 * reports a syntax error rather than swallowing the rest of
+                 * the file as a body.  Once hd_scan is set every following
+                 * line is treated as document text, so the quote check above
+                 * would never see the imbalance again — bail out here and
+                 * let the final verdict report the unterminated string. */
+                if (in_s || in_d) { hd_n = hd_head; }
+                else if (hd_n > hd_head) hd_scan = 1;  /* body starts next line */
             }
             continue;
         }
@@ -2013,11 +2130,41 @@ static void history_trim_front(int drop) {
     if (sh->hist_written < 0) sh->hist_written = 0;
 }
 
+/* Should this line be kept out of the history?
+ *
+ * HISTIGNORE is a colon-separated list of patterns; a line matching any of
+ * them is not recorded.  bash anchors each pattern at the start of the line
+ * and matches it against the whole line, so `ls*` suppresses `ls` and
+ * `ls -l` but not `sudo ls`.  The `&` placeholder — bash's shorthand for
+ * "whatever was ignored last time" — is not supported, and the pattern is
+ * treated as a glob (`*`, `?`, `[...]`) rather than a regular expression.
+ *
+ * The README advertised HISTIGNORE long before it existed; this makes the
+ * documented behaviour real. */
+static int history_is_ignored(const char *line) {
+    const char *pat = sh_getenv("HISTIGNORE");
+    if (!pat || !*pat) return 0;
+
+    char *copy = sh_strdup(pat);
+    int ignored = 0;
+    char *save = NULL;
+    for (char *p = strtok_r(copy, ":", &save); p; p = strtok_r(NULL, ":", &save)) {
+        if (!*p) continue;
+        /* fnmatch's default flags give bash's anchored, whole-line match:
+         * the pattern must cover the line from its first character. */
+        if (fnmatch(p, line, 0) == 0) { ignored = 1; break; }
+    }
+    free(copy);
+    return ignored;
+}
+
 void history_add(const char *line) {
     Shell *sh = shell_get();
     if (!line || !*line) return;
     if (sh->opt_histignoredups && sh->nhist > 0 &&
         strcmp(sh->history[sh->nhist - 1], line) == 0)
+        return;
+    if (history_is_ignored(line))
         return;
     hist_ensure_cap(sh->nhist + 2);
     sh->history[sh->nhist] = sh_strdup(line);
@@ -2163,6 +2310,15 @@ void shell_init(void) {
 
     if (getcwd(sh->cwd, sizeof(sh->cwd)) == NULL)
         sh->cwd[0] = '\0';
+    /* `$$` is fixed for the life of the shell: record this process's pid
+     * once, so expansions running inside a forked child still report the
+     * main shell's pid, as bash does. */
+    sh->shell_pid = getpid();
+    /* Trap bookkeeping lives outside the Shell struct's own storage: the
+     * handler touches trap_pending asynchronously, so it is a separate
+     * allocation that the signal handler can rely on being valid. */
+    sh->trap_pending = calloc(NSIG, sizeof(sig_atomic_t));
+    if (!sh->trap_pending) { perror("calloc"); exit(1); }
     snprintf(sh->prompt, sizeof(sh->prompt), "\x1b[1;32mbesh\x1b[0m:\x1b[1;34m\\W\x1b[0m$ ");
 
     /* init variable storage */
@@ -2247,6 +2403,10 @@ void shell_destroy(void) {
         history_save();
         term_restore();
     }
+    /* drop the trap table and its pending flags */
+    for (int s = 1; s < NSIG; s++) free(sh->traps[s]);
+    free((void *)sh->trap_pending);
+    sh->trap_pending = NULL;
     /* free the process-substitution bookkeeping.  psub_reap() normally
      * empties this queue after every command; anything still recorded here
      * at shutdown belongs to a substitution whose command never completed
@@ -2312,6 +2472,20 @@ void shell_destroy(void) {
     /* free line buf */
     free(sh->line_buf);
     /* job list handled async */
+}
+
+/* Abort on a fatal error, after tearing the shell down.
+ *
+ * bash exits immediately on a bad substitution or a similar unrecoverable
+ * expansion error, and scripts rely on that.  Calling exit(2) straight from
+ * the expander, though, skipped shell_destroy(), which is what restores the
+ * terminal mode and flushes the history file — so an interactive session
+ * could be left with the terminal in raw mode.  This routes the exit
+ * through the normal teardown while keeping the status and the "stop now"
+ * semantics. */
+void shell_fatal(int status) {
+    shell_destroy();
+    exit(status);
 }
 
 /* ---- prompt builder (bash PS1 + zsh prompt escapes) ---------- */
@@ -2772,6 +2946,11 @@ int main(int argc, char **argv) {
             sh->exit_status = execute_string(trimmed);
             sh->job_interactive = saved_jc;
             sh->return_request = 0;   /* drop a stray top-level return */
+            /* A trap may have fired while the command was running (its
+             * action ran inside execute_node_internal); anything that
+             * arrived after the last safe point is run now, before the
+             * prompt is drawn. */
+            trap_run_pending();
             /* `set -e` at the top level leaves the shell, like bash -e */
             if (sh->exit_request) {
                 sh->exit_request = 0;

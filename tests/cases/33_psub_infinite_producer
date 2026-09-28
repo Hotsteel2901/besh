@@ -1,0 +1,28 @@
+# Regression: an unbounded process-substitution producer must not deadlock.
+#
+# A previous fix called the *blocking* psub_reap() on entry to every node,
+# to cover every return path.  With a self-consuming consumer that is a
+# deadlock, because the reaper waits for the producer while the consumer
+# is still reading from it:
+#
+#     while read l; do echo "$l"; done < <(yes)
+#
+# The consumer stopped draining (blocked in the reaper), the producer
+# blocked in write(2), and neither side could progress — the shell hung
+# until killed.  Only the non-blocking reaper may run inside a loop body.
+#
+# `yes | head` is bounded so this test terminates under both shells.
+
+yes | head -n 3
+echo "pipe ok"
+
+# Same shape through a process substitution + read loop.  `head` closes
+# the pipe, so `yes` dies of SIGPIPE and the loop drains and exits.
+while read -r l; do echo "got $l"; done < <(yes yes | head -n 2)
+echo "psub loop ok"
+
+# A producer that outlives its consumer must not be waited for: the
+# shell has to return promptly even though the child is still alive.
+echo "before"
+cat <(echo quick) > /dev/null
+echo "after"

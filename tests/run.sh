@@ -22,6 +22,9 @@ set -u
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(dirname -- "$here")
 BESH=${BESH:-$root/besh}
+# Export it so a besh-only case can invoke the same shell under test even
+# though its body runs from a scratch directory (see tests/only/*).
+export BESH
 VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 

@@ -1,0 +1,49 @@
+# Regression: array expansion must keep the surrounding prefix and suffix.
+#
+# The `${a[@]}` branch reset the accumulator before the last element, which
+# threw away any prefix whenever the array held exactly one element:
+#
+#     a=(only); echo "x${a[@]}y"     # printed "onlyy"
+#
+# bash prints "xonlyy".  The prefix belongs to the first field and the
+# suffix to the last one, so neither may be dropped.
+
+a=(only)
+echo "x${a[@]}y"
+
+a=(one two three)
+echo "x${a[@]}y"
+
+# word splitting: the prefix attaches to the first field, the suffix to the
+# last, and the middle elements stand alone
+for w in x${a[@]}y; do
+    echo "[$w]"
+done
+
+# prefix only / suffix only
+echo "pre${a[@]}"
+echo "${a[@]}post"
+
+# two substitutions in one word
+echo "p${a[@]}m${a[@]}s"
+
+# quoted vs unquoted
+echo "${a[@]}"
+
+# empty array: both sides still present for $*, nothing for $@
+e=()
+echo "x${e[@]}y"
+echo "x${e[*]}y"
+
+# single element with ${a[*]}
+o=(solo)
+echo "x${o[*]}y"
+
+# prefix around a positional-parameter expansion too
+set -- p1 p2 p3
+echo "P${@}S"
+echo "P${*}S"
+
+# and around ${a[@]} built from an assignment on the same line
+b=(alpha beta)
+echo "begin${b[@]}end"

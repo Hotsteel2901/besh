@@ -29,6 +29,78 @@ static ASTNode *parse_while(Lexer *l, int is_until);
 static ASTNode *parse_case(Lexer *l);
 static ASTNode *parse_funcdef(Lexer *l, char *name);
 
+/* ---- pending here-document queue ---------------------------- */
+/* Here-document bodies follow the *whole* command line, not the command
+ * they are attached to.  A pipeline makes the difference visible:
+ *
+ *     cat <<EOF | cat
+ *     body
+ *     EOF
+ *
+ * The body comes after `| cat`, so reading it as soon as `cat <<EOF` is
+ * parsed would consume `| cat` as document text — which is exactly what
+ * happened: the rest of the pipeline ended up printed literally.  Bodies
+ * are therefore recorded here during parsing and drained in declaration
+ * order by parse_complete(), once the entire line has been consumed.
+ *
+ * The Redir objects belong to the AST and outlive this list, so only the
+ * pointers are stored. */
+typedef struct PendingHeredoc {
+    Redir *redir;
+    struct PendingHeredoc *next;
+} PendingHeredoc;
+
+static PendingHeredoc *pending_head = NULL;
+static PendingHeredoc *pending_tail = NULL;
+
+static void pending_push(Redir *r) {
+    PendingHeredoc *n = sh_malloc(sizeof(*n));
+    n->redir = r;
+    n->next = NULL;
+    if (pending_tail) pending_tail->next = n;
+    else              pending_head = n;
+    pending_tail = n;
+}
+
+/* Read every queued body, in the order the `<<` operators appeared.
+ *
+ * Called from parse_complete() once the whole line has been parsed.  Each
+ * entry remembers the exact input offset just past the newline that ended
+ * its declaration line, captured while the lexer was still on that line
+ * (see body_pos on Redir).  Seeking there explicitly makes the drain
+ * independent of how far parse_list's lookahead ran ahead — which is what
+ * makes it correct for a pipeline, where `| cat` follows the `<<EOF` and
+ * must not be mistaken for document text.
+ *
+ * Only the *first* body needs that seek.  lexer_heredoc_ex leaves the lexer
+ * just past each body's terminator, so consecutive bodies continue from
+ * there; seeking absolutely for every entry would be wrong when several
+ * `<<` share a line — `cat <<A <<B` — because they would all point at the
+ * same offset and the first body would be re-read looking for `B`. */
+static void pending_drain(Lexer *l) {
+    int first = 1;
+    for (PendingHeredoc *n = pending_head; n; ) {
+        PendingHeredoc *next = n->next;
+        Redir *r = n->redir;
+        r->delim_pending = 0;
+        if (first) {
+            if (r->body_pos >= 0 && r->body_pos <= l->len)
+                l->pos = r->body_pos;
+            first = 0;
+        }
+        r->heredoc = lexer_heredoc_ex(l, r->filename,
+                                      r->type == REDIR_HEREDOC_DASH, 1);
+        /* lexer_heredoc_ex stops *on* the newline that follows the
+         * terminator; step over it so the next body starts on its own
+         * first line instead of a spurious blank one */
+        while (l->pos < l->len && l->input[l->pos] != '\n') l->pos++;
+        if (l->pos < l->len) l->pos++;
+        free(n);
+        n = next;
+    }
+    pending_head = pending_tail = NULL;
+}
+
 /* ---- AST node allocation ------------------------------------- */
 static ASTNode *ast_new(NodeType type) {
     ASTNode *n = sh_malloc(sizeof(ASTNode));
@@ -39,6 +111,25 @@ static ASTNode *ast_new(NodeType type) {
 
 void ast_free(ASTNode *node) {
     if (!node) return;
+
+    /* Redirections can hang off *any* node: a simple command owns the ones
+     * written after it, and parse_compound_redirs() attaches the trailing
+     * ones (`if ...; fi >f`, `( ... ) 2>&1`, `while ...; done <x`, ...) to
+     * the compound node itself.  Freeing them inside the NODE_COMMAND case
+     * alone, as this used to, leaked every redirection belonging to a
+     * compound construct — the struct, its filename and its heredoc body. */
+    {
+        Redir *r = node->redirs;
+        while (r) {
+            Redir *next = r->next;
+            free(r->filename);
+            free(r->heredoc);
+            free(r);
+            r = next;
+        }
+        node->redirs = NULL;
+    }
+
     switch (node->type) {
     case NODE_COMMAND:
     case NODE_REDIRECT:
@@ -48,16 +139,6 @@ void ast_free(ASTNode *node) {
         }
         free(node->argv_quoted);
         node->argv_quoted = NULL;
-        {
-            Redir *r = node->redirs;
-            while (r) {
-                Redir *next = r->next;
-                free(r->filename);
-                free(r->heredoc);
-                free(r);
-                r = next;
-            }
-        }
         break;
     case NODE_PIPELINE:
     case NODE_LIST:
@@ -78,6 +159,13 @@ void ast_free(ASTNode *node) {
         ast_free(node->func_body);
         break;
     case NODE_FOR:
+        /* NODE_FOR keeps the loop variable name in func_name (see
+         * parse_for) — without this free the name leaked on every
+         * executed `for` that was not part of a function definition. */
+        free(node->func_name);
+        ast_free(node->cond);
+        ast_free(node->body);
+        break;
     case NODE_WHILE:
         ast_free(node->cond);
         ast_free(node->body);
@@ -93,6 +181,7 @@ void ast_free(ASTNode *node) {
             for (int i = 0; i < node->case_count; i++)
                 free(node->case_patterns[i]);
         free(node->case_patterns);
+        free(node->case_pat_literal);
         if (node->case_bodies)
             for (int i = 0; i < node->case_count; i++)
                 ast_free(node->case_bodies[i]);
@@ -202,6 +291,8 @@ static Redir *parse_redirection(Lexer *l) {
             int save_pos = l->pos;
             int save_type = l->token_type;
             int save_quoted = l->token_quoted;
+            int save_fd = l->token_fd;
+            int save_escaped = l->token_escaped;
             char *save_text = sh_strdup(l->token_text);
             lexer_next(l);
 
@@ -216,6 +307,10 @@ static Redir *parse_redirection(Lexer *l) {
                     free(r->filename);
                     r->filename = NULL;
                     lexer_next(l);
+                    /* the token text was copied only so the rewind below
+                     * could restore it; this path keeps the peeked token,
+                     * so the copy has to go or it leaks with every `>&N` */
+                    free(save_text);
                     return r;
                 }
             }
@@ -225,6 +320,13 @@ static Redir *parse_redirection(Lexer *l) {
             l->pos = save_pos;
             l->token_type = save_type;
             l->token_quoted = save_quoted;
+            /* token_fd and token_escaped describe the token just like
+             * token_text does, so leaving them at the *peeked* token's
+             * values made the caller see a redirection fd or a quoting
+             * flag that belonged to a different word.  Restore the whole
+             * token, not part of it. */
+            l->token_fd = save_fd;
+            l->token_escaped = save_escaped;
         }
 
         r->type = REDIR_BOTH;
@@ -237,6 +339,8 @@ static Redir *parse_redirection(Lexer *l) {
         int save_pos = l->pos;
         int save_type = l->token_type;
         int save_quoted = l->token_quoted;
+        int save_fd = l->token_fd;
+        int save_escaped = l->token_escaped;
         char *save_text = sh_strdup(l->token_text);
         lexer_next(l);
 
@@ -250,6 +354,7 @@ static Redir *parse_redirection(Lexer *l) {
                 r->fd     = close_it ? -1 : atoi(d);
                 r->filename = NULL;
                 lexer_next(l);
+                free(save_text);          /* unused on the dup path */
                 return r;
             }
         }
@@ -259,6 +364,8 @@ static Redir *parse_redirection(Lexer *l) {
         l->pos = save_pos;
         l->token_type = save_type;
         l->token_quoted = save_quoted;
+        l->token_fd = save_fd;
+        l->token_escaped = save_escaped;
         r->type = REDIR_ERR;
         r->src_fd = STDERR_FILENO;
         break;
@@ -297,6 +404,19 @@ static Redir *parse_redirection(Lexer *l) {
              * lexer_heredoc() for each in turn once the line is consumed. */
             r->heredoc = NULL;
             r->delim_pending = 1;
+            /* Remember where this body will start: just past the newline
+             * that ends the current (declaration) line.  The whole line is
+             * parsed before any body is read, so we cannot assume the
+             * lexer will still be near here later — a pipeline such as
+             * `cat <<EOF | cat` has more tokens to consume first. */
+            r->body_pos = -1;
+            for (int i = l->pos; i < l->len; i++) {
+                if (l->input[i] == '\n') { r->body_pos = i + 1; break; }
+            }
+            if (r->body_pos < 0) r->body_pos = l->len;   /* no newline: EOF */
+            /* the body is read by parse_complete() after the whole line,
+             * not here — a pipeline continues past this point */
+            pending_push(r);
             lexer_next(l);
         }
     } else {
@@ -376,20 +496,9 @@ static ASTNode *parse_simple_command(Lexer *l) {
         break;
     }
 
-    /* The command line is fully consumed, so the here-document bodies that
-     * follow it can now be read — in declaration order, which is exactly
-     * the order of the redirection chain.  `cat <<A <<B` therefore yields
-     * B's body as stdin, matching bash, and no declaration is skipped.
-     * (bash reads them in the same pass; separating the two phases is what
-     * lets every `<<` on the line be seen before the first body is taken.) */
-    for (Redir *hr = node->redirs; hr; hr = hr->next) {
-        if (!hr->delim_pending) continue;
-        hr->delim_pending = 0;
-        hr->heredoc = lexer_heredoc_ex(l, hr->filename,
-                                       hr->type == REDIR_HEREDOC_DASH, 1);
-        /* lexer_heredoc_ex advanced pos past the body — refresh lookahead */
-        lexer_next(l);
-    }
+    /* Here-document bodies are *not* read here: they follow the entire
+     * command line, and a pipeline or a list continues past this command.
+     * parse_complete() drains the queue once the line is fully consumed. */
 
     /* check if first word is a builtin alias — expand it */
     if (node->argc > 0) {
@@ -467,15 +576,7 @@ static void parse_compound_redirs(Lexer *l, ASTNode *node) {
         last = r;
     }
 
-    /* see parse_command: heredoc bodies are read after every declaration
-     * on the line has been collected, in declaration order */
-    for (Redir *hr = node->redirs; hr; hr = hr->next) {
-        if (!hr->delim_pending) continue;
-        hr->delim_pending = 0;
-        hr->heredoc = lexer_heredoc_ex(l, hr->filename,
-                                       hr->type == REDIR_HEREDOC_DASH, 1);
-        lexer_next(l);
-    }
+    /* bodies are read by parse_complete(), after the whole line */
 }
 
 /* ---- parse a command: simple_command | subshell | funcdef | if | for | while -- */
@@ -557,6 +658,8 @@ static ASTNode *parse_command(Lexer *l) {
             int save_pos = l->pos;
             int save_type = l->token_type;
             int save_quoted = l->token_quoted;
+            int save_fd = l->token_fd;
+            int save_escaped = l->token_escaped;
             char *save_text = sh_strdup(l->token_text);   /* copy before lexer_next frees it */
 
             int next = lexer_next(l);
@@ -576,6 +679,8 @@ static ASTNode *parse_command(Lexer *l) {
                 l->pos = save_pos;
                 l->token_type = save_type;
                 l->token_quoted = save_quoted;
+                l->token_fd = save_fd;
+                l->token_escaped = save_escaped;
             } else {
                 /* rewind */
                 free(l->token_text);
@@ -583,6 +688,8 @@ static ASTNode *parse_command(Lexer *l) {
                 l->pos = save_pos;
                 l->token_type = save_type;
                 l->token_quoted = save_quoted;
+                l->token_fd = save_fd;
+                l->token_escaped = save_escaped;
             }
         }
 
@@ -667,6 +774,16 @@ static ASTNode *parse_list(Lexer *l) {
     while (l->token_type == TOK_SEMI || l->token_type == TOK_BG ||
            l->token_type == TOK_NEWLINE) {
         int tok = l->token_type;
+
+        /* A here-document body follows the *complete command line*, so it
+         * must be consumed before the next statement is parsed — otherwise
+         * the body lines are read as commands.  The `\n` token is the line
+         * boundary; `;` and `&` keep us on the same line, so only the
+         * newline branch drains.  Do this *before* lexer_next() so the
+         * lexer has not yet tokenised the first body line. */
+        if (tok == TOK_NEWLINE && pending_head)
+            pending_drain(l);
+
         lexer_next(l);
 
         if (tok == TOK_BG) {
@@ -857,6 +974,7 @@ static ASTNode *parse_case(Lexer *l) {
     /* collect patterns and bodies */
     int cap = 8;
     node->case_patterns = sh_malloc(cap * sizeof(char *));
+    node->case_pat_literal = sh_malloc(cap * sizeof(int));
     node->case_bodies = sh_malloc(cap * sizeof(ASTNode *));
     node->case_count = 0;
 
@@ -866,11 +984,32 @@ static ASTNode *parse_case(Lexer *l) {
             break;
         }
 
-        /* collect patterns until ) */
-        char *patterns[64];
-        int npat = 0;
-        while (l->token_type == TOK_WORD && npat < 64) {
-            patterns[npat++] = sh_strdup(l->token_text);
+        /* collect patterns until )
+         *
+         * Both limits here used to truncate silently: a branch with more
+         * than 64 alternatives dropped the extras (and, worse, left the
+         * 65th token to be mistaken for the next branch's pattern), and a
+         * joined pattern longer than 4 KiB was cut mid-way, so the branch
+         * simply never matched.  Grow instead of dropping. */
+        int pcap = 8, npat = 0;
+        char **patterns = sh_malloc(pcap * sizeof(char *));
+        int *pat_lit = sh_malloc(pcap * sizeof(int));
+        size_t pat_len = 0;
+        while (l->token_type == TOK_WORD) {
+            if (npat == pcap) {
+                pcap *= 2;
+                patterns = sh_realloc(patterns, pcap * sizeof(char *));
+                pat_lit  = sh_realloc(pat_lit, pcap * sizeof(int));
+            }
+            patterns[npat] = sh_strdup(l->token_text);
+            /* A pattern written entirely as one quoted word compares
+             * literally (`case x in "a*")`), while an unquoted one is a
+             * glob.  The lexer only records "quotes were involved", so
+             * this is the closest exact test available: the word consisted
+             * of a single quoted span and nothing else. */
+            pat_lit[npat] = l->token_quoted ? 1 : 0;
+            pat_len += strlen(patterns[npat]) + 1;   /* +1 for the `|` */
+            npat++;
             lexer_next(l);
             if (l->token_type == TOK_PIPE) lexer_next(l);  /* | between patterns */
         }
@@ -878,16 +1017,26 @@ static ASTNode *parse_case(Lexer *l) {
         if (l->token_type == TOK_RPAREN) lexer_next(l);
 
         /* join patterns with | */
-        char pat_buf[4096] = "";
+        char *pat_buf = sh_malloc(pat_len + 1);
+        size_t at = 0;
+        int all_literal = (npat > 0);
         for (int i = 0; i < npat; i++) {
-            if (i > 0) strcat(pat_buf, "|");
-            strncat(pat_buf, patterns[i], sizeof(pat_buf) - strlen(pat_buf) - 1);
+            if (i > 0) pat_buf[at++] = '|';
+            size_t nl = strlen(patterns[i]);
+            memcpy(pat_buf + at, patterns[i], nl);
+            at += nl;
+            if (!pat_lit[i]) all_literal = 0;
             free(patterns[i]);
         }
+        pat_buf[at] = '\0';
+        free(patterns);
+        free(pat_lit);
+        int pat_is_literal = all_literal;
 
         if (node->case_count >= cap) {
             cap *= 2;
             node->case_patterns = sh_realloc(node->case_patterns, cap * sizeof(char *));
+            node->case_pat_literal = sh_realloc(node->case_pat_literal, cap * sizeof(int));
             node->case_bodies = sh_realloc(node->case_bodies, cap * sizeof(ASTNode *));
         }
 
@@ -903,7 +1052,8 @@ static ASTNode *parse_case(Lexer *l) {
         /* skip newlines between case branches */
         while (l->token_type == TOK_NEWLINE) lexer_next(l);
 
-        node->case_patterns[node->case_count] = sh_strdup(pat_buf);
+        node->case_patterns[node->case_count] = pat_buf;
+        node->case_pat_literal[node->case_count] = pat_is_literal;
         node->case_bodies[node->case_count] = body;
         node->case_count++;
     }
@@ -941,26 +1091,70 @@ static ASTNode *parse_funcdef(Lexer *l, char *name) {
         /* this shouldn't happen for { }, but handle gracefully */
     }
 
-    /* register the function */
-    Shell *sh = shell_get();
-    if (sh->nfuncs >= sh->funcs_cap) {
-        sh->funcs_cap *= 2;
-        sh->funcs = sh_realloc(sh->funcs, sh->funcs_cap * sizeof(Function));
-    }
-    sh->funcs[sh->nfuncs].name = sh_strdup(name);
-    sh->funcs[sh->nfuncs].body = node->func_body;
-    sh->nfuncs++;
-
-    /* transfer ownership of body to the funcs table so ast_free
-     * on this node does not free it (prevents double-free) */
-    node->func_body = NULL;
-
+    /* The definition is *not* registered here.  Parsing happens for the
+     * whole command line before a single statement runs, so registering at
+     * parse time made the definition order wrong whenever the two were
+     * interleaved on one line:
+     *
+     *     h() { echo old; }; unset -f h; h() { echo new; }; h
+     *
+     * The parse-time registration inserted `h`, `unset -f h` then removed
+     * it again when it executed, and the call found nothing (bash prints
+     * `new`).  Registration is deferred to execution time instead, where
+     * the statements run in their real order — see func_register() and
+     * NODE_FUNCDEF in executor.c. */
+    /* kept so NODE_FUNCDEF can install it at execution time */
     return node;
+}
+
+/* Install (or replace) a shell function.  Called when a NODE_FUNCDEF is
+ * *executed*, so that definition, `unset -f` and invocation observe the
+ * order the user actually wrote.  Redefinition overwrites in place:
+ * exec_func_lookup() returns the first match, so appending a duplicate
+ * would pin the stale body forever.
+ *
+ * Takes ownership of `body` on success. */
+void func_register(const char *name, ASTNode *body) {
+    Shell *sh = shell_get();
+    int slot = -1;
+    for (int i = 0; i < sh->nfuncs; i++) {
+        if (strcmp(sh->funcs[i].name, name) == 0) { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (sh->nfuncs >= sh->funcs_cap) {
+            sh->funcs_cap = sh->funcs_cap ? sh->funcs_cap * 2 : 16;
+            sh->funcs = sh_realloc(sh->funcs, sh->funcs_cap * sizeof(Function));
+        }
+        slot = sh->nfuncs++;
+        sh->funcs[slot].name = sh_strdup(name);
+        sh->funcs[slot].body = NULL;
+    } else {
+        ast_free(sh->funcs[slot].body);   /* drop the superseded body */
+    }
+    sh->funcs[slot].body = body;
 }
 
 /* ---- entry point — parse a complete command line ------------- */
 ASTNode *parse_complete(Lexer *l) {
     lexer_next(l);  /* prime first token */
     if (l->token_type == TOK_EOF) return NULL;
-    return parse_list(l);
+
+    /* a previous parse may have been abandoned mid-line (syntax error,
+     * early return); drop anything it queued so the bodies of this line
+     * are not read against a stale list */
+    while (pending_head) {
+        PendingHeredoc *n = pending_head;
+        pending_head = n->next;
+        free(n);
+    }
+    pending_tail = NULL;
+
+    ASTNode *ast = parse_list(l);
+
+    /* Anything still queued belongs to a line that had no trailing newline
+     * (e.g. `cat <<EOF` as the last text in -c).  Reading it now is the
+     * only chance, and matches bash's end-of-input behaviour. */
+    if (pending_head) pending_drain(l);
+
+    return ast;
 }

@@ -1,0 +1,63 @@
+# `trap` used to be a stub: it accepted its arguments, did nothing, and
+# printed nothing.  A script that installed a cleanup or signal handler
+# therefore ran no handler at all, and `trap 'cmd' EXIT` looked accepted
+# while `cmd` would never run.
+#
+# This is a besh-only case because two deliberate divergences from bash
+# are baked into the expectations:
+#   - bash silently accepts `trap 'x' KILL` (rc 0) even though the signal
+#     cannot be caught; besh reports the error and returns 1.
+#   - bash accepts `trap 'x' EXIT` and then runs the action at exit; besh
+#     does not implement the EXIT pseudo-signal, so it says so instead of
+#     pretending — a silently-dropped cleanup step is the worse failure.
+#
+# The action runs at a safe point between commands (never inside the
+# signal handler), so the output appears before the next echo.
+
+trap 'echo caught-usr1' USR1
+kill -USR1 $$
+sleep 0.1
+echo after-usr1
+
+# an ignored signal must not kill the shell
+trap '' USR1
+kill -USR1 $$
+sleep 0.1
+echo survived-ignore
+
+# resetting restores the default handling
+trap - USR1
+trap 'echo x' TERM
+trap - TERM
+echo reset-ok
+
+# listing format matches bash's `trap -- 'action' SIGNAME`
+trap 'echo one' USR2
+trap -p USR2
+trap - USR2
+
+# several signals in one call
+trap 'echo multi' USR1 USR2
+trap -p USR1
+trap -p USR2
+trap - USR1 USR2
+
+# errors
+trap 'x' NOSUCHSIG 2>/dev/null
+echo "bad-sig rc=$?"
+trap 'x' KILL 2>/dev/null
+echo "kill rc=$?"
+trap 'x' EXIT 2>/dev/null
+echo "exit rc=$?"
+
+--- expect ---
+caught-usr1
+after-usr1
+survived-ignore
+reset-ok
+trap -- 'echo one' SIGUSR2
+trap -- 'echo multi' SIGUSR1
+trap -- 'echo multi' SIGUSR2
+bad-sig rc=1
+kill rc=1
+exit rc=1

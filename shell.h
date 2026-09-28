@@ -123,6 +123,7 @@ typedef struct Redir {
     int            src_fd;      /* source fd (stdin/stdout/err) */
     int            quoted;      /* 1 if heredoc delim was quoted */
     int            delim_pending; /* 1 = heredoc body not read yet */
+    int            body_pos;    /* input offset where the body starts */
     struct Redir *next;
 } Redir;
 
@@ -155,6 +156,11 @@ typedef struct ASTNode {
     /* NODE_CASE */
     char          *case_word;
     char         **case_patterns;
+    /* Parallel to case_patterns: 1 when that alternative was written as a
+     * single quoted word (`case x in "a*")`), which makes it a literal
+     * comparison rather than a glob.  Without this the two forms are
+     * indistinguishable once the quoting has been removed. */
+    int           *case_pat_literal;
     struct ASTNode **case_bodies;
     int            case_count;
 
@@ -178,6 +184,7 @@ typedef struct Job {
     int         npids;
     char       *command;      /* original command line            */
     JobStatus   status;
+    int         last_status;  /* exit status of the final process */
     struct Job *next;
 } Job;
 
@@ -289,8 +296,23 @@ typedef struct Shell {
     /* job control */
     Job         *jobs;
     int          njob;
+
+    /* Statuses of children that have already been collected.  bash lets a
+     * script call `wait $pid` more than once and get the same answer, and
+     * a later `wait` must also still report a job that finished while the
+     * shell was busy.  Once the process is gone the kernel can no longer
+     * tell us anything, so the value is remembered here.  Fixed-size ring:
+     * only a handful of recent pids can ever be asked about again. */
+    struct { pid_t pid; int status; } reaped_cache[16];
+    int          reaped_next;
     pid_t        shell_pgid;
     int          job_interactive;
+    /* PID reported by `$$`.  Captured once at startup: a child forked for
+     * a command substitution, a pipeline stage or a subshell would answer
+     * getpid() with its *own* pid, so `$$` used to change value between
+     * lines and a script could write `foo.$$` and then fail to find it.
+     * bash makes `$$` constant for the life of the shell. */
+    pid_t        shell_pid;
 
     /* terminal */
     int          term_fd;
@@ -367,6 +389,18 @@ typedef struct Shell {
     ScopeFrame  *scopes;
     int          nscopes;
     int          scopes_cap;
+
+    /* signal traps (`trap 'cmd' SIG`).  The handler must stay
+     * async-signal-safe, so it only records which signal arrived; the
+     * action string is run later at a safe point (between commands in
+     * execute_node_internal, and once per REPL iteration).
+     *
+     * Indexed by signal number.  A NULL entry means "default handling";
+     * "" means "ignored" — the same distinction bash draws between
+     * `trap - SIG` and `trap '' SIG`. */
+    char        *traps[NSIG];
+    volatile sig_atomic_t *trap_pending;   /* NSIG flags, set in handler */
+    int          in_trap_handler;          /* guard against re-entry */
 } Shell;
 
 /* -------------------------------------------------------------------
@@ -375,6 +409,25 @@ typedef struct Shell {
 Shell *shell_get(void);
 void   shell_init(void);
 void   shell_destroy(void);
+/* Bail out of a fatal, non-recoverable error the way bash does — but tear
+ * the shell down first, so the terminal mode is restored and history is
+ * flushed.  Calls exit() and never returns. */
+void   shell_fatal(int status);
+
+/* Signals -----------------------------------------------------------------
+ * trap_set / trap_get manage the action table.  trap_run_pending executes
+ * any action whose signal has arrived and is called at safe points; it is
+ * a no-op when nothing is pending.  trap_handler is what trap_set installs:
+ * it only records the signal, because the handler may not run the parser. */
+void        trap_set(int sig, const char *action);
+const char *trap_get(int sig);
+void        trap_run_pending(void);
+void        trap_handler(int sig);
+/* Translate "INT" / "SIGINT" / "2" to a signal number, or -1 if unknown. */
+int         trap_signal_number(const char *name);
+/* The interactive Ctrl-C handler (redraws the prompt).  `trap ... INT`
+ * replaces it, `trap - INT` puts it back. */
+void        sigint_handler(int sig);
 
 /* -------------------------------------------------------------------
  *  lexer.c
@@ -393,6 +446,12 @@ typedef struct {
                                   * (quote removal, no body expansion). */
     int         token_fd;        /* fd number for `N>`/`N<` tokens,
                                   * -1 when the token carried none  */
+    int         syntax_error;    /* 1 after an unterminated quote (or a
+                                  * similar tokeniser-level error).  bash
+                                  * aborts the whole line/script with
+                                  * status 2 in that case, so the driver
+                                  * checks this and stops rather than
+                                  * executing a mangled command. */
 } Lexer;
 
 Lexer *lexer_new(const char *input);
@@ -407,6 +466,7 @@ char  *lexer_heredoc_ex(Lexer *l, const char *delim, int strip_tabs,
  * ------------------------------------------------------------------- */
 ASTNode *parse_complete(Lexer *l);
 void     ast_free(ASTNode *node);
+void     func_register(const char *name, ASTNode *body);
 void     ast_print(ASTNode *node, int indent);
 
 /* -------------------------------------------------------------------
@@ -418,6 +478,7 @@ int  execute_command(ASTNode *node);
 int  execute_string(const char *cmd);
 void psub_register(int pid, int fd);
 void psub_reap(void);
+void psub_reap_nonblock(void);
 
 /* -------------------------------------------------------------------
  *  builtins.c
@@ -511,6 +572,13 @@ void sigchld_unblock(void);
 void  job_add(pid_t pgid, pid_t *pids, int npids, const char *cmd);
 void  job_update(pid_t pid, int status);
 void  job_remove(pid_t pgid);
+/* Collect one specific child, tolerating a concurrent SIGCHLD reap.
+ * Returns its exit status, or -1 when nothing is left to collect. */
+int   job_reap_pid(pid_t pid, int *stopped);
+/* Remember / look up the status of a child that has already been reaped,
+ * so `wait $pid` can be called more than once like it can in bash. */
+void  job_remember_status(pid_t pid, int status);
+int   job_recall_status(pid_t pid);
 Job  *job_find_by_pgid(pid_t pgid);
 Job  *job_find_by_id(int id);
 void  job_print(Job *j);

@@ -1,0 +1,25 @@
+# `read` with several names: every name but the last takes one field, and
+# the last sweeps up the rest of the line *verbatim*.
+#
+# Two bugs lived here.  The line buffer was a fixed 64 KiB array, so a
+# longer line was truncated (bash read all of it).  Field splitting then
+# used strtok_r(), which overwrites the separators with NULs, so the last
+# variable could not recover "the rest of the line" and the code
+# re-joined the split fields with a single space — losing the original
+# runs of whitespace and dropping everything past the 64 KiB token cap.
+
+printf 'x y z  w\n' | { read a b;     echo "[$a][$b]"; }
+printf 'x y z  w\n' | { read a b c;   echo "[$a][$b][$c]"; }
+printf 'x y z  w\n' | { read a;       echo "[$a]"; }
+printf 'x y z  w\n' | { read;         echo "[$REPLY]"; }
+printf 'x y z  w\n' | { read a b c d; echo "[$a][$b][$c][$d]"; }
+printf 'x y z  w\n' | { read a b c d e; echo "[$a][$b][$c][$d][$e]"; }
+
+# fewer fields than names
+printf 'solo\n' | { read a b; echo "[$a][$b]"; }
+
+# a long line must survive intact
+python3 -c "print('q'*200000)" > /tmp/besh_read_long.$$
+read -r l < /tmp/besh_read_long.$$
+echo "long=${#l}"
+rm -f /tmp/besh_read_long.$$

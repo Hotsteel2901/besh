@@ -87,6 +87,7 @@ void job_add(pid_t pgid, pid_t *pids, int npids, const char *cmd) {
     j->npids = npids;
     j->command = sh_strdup(cmd ? cmd : "");
     j->status = JOB_RUNNING;
+    j->last_status = 0;
     j->next = sh->jobs;
     sh->jobs = j;
 }
@@ -96,9 +97,16 @@ void job_update(pid_t pid, int status) {
     for (Job *j = sh->jobs; j; j = j->next) {
         for (int i = 0; i < j->npids; i++) {
             if (j->pids[i] == pid) {
-                if (WIFSTOPPED(status))
+                if (WIFSTOPPED(status)) {
                     j->status = JOB_STOPPED;
-                else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                } else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                    /* Remember how the job finished so `wait` can report
+                     * it: the Job list is the only record left once the
+                     * SIGCHLD handler has reaped the process. */
+                    j->last_status = WIFSIGNALED(status)
+                                   ? 128 + WTERMSIG(status)
+                                   : WEXITSTATUS(status);
+                    job_remember_status(pid, j->last_status);
                     /* mark this pid as done */
                     j->pids[i] = 0;
                     /* check if all pids in job are done */
@@ -112,6 +120,85 @@ void job_update(pid_t pid, int status) {
             }
         }
     }
+}
+
+/* ---- recently collected child statuses ----------------------- */
+void job_remember_status(pid_t pid, int status) {
+    Shell *sh = shell_get();
+    int slot = sh->reaped_next;
+    sh->reaped_cache[slot].pid = pid;
+    sh->reaped_cache[slot].status = status;
+    sh->reaped_next = (slot + 1) % (int)(sizeof(sh->reaped_cache) /
+                                         sizeof(sh->reaped_cache[0]));
+}
+
+/* -1 when this pid was never seen */
+int job_recall_status(pid_t pid) {
+    Shell *sh = shell_get();
+    int n = (int)(sizeof(sh->reaped_cache) / sizeof(sh->reaped_cache[0]));
+    for (int i = 0; i < n; i++)
+        if (sh->reaped_cache[i].pid == pid) return sh->reaped_cache[i].status;
+    return -1;
+}
+
+/* Reap one specific pid, tolerating the SIGCHLD handler having beaten us
+ * to it.  Returns the child's exit status, or -1 when there is nothing
+ * left to collect for it (bash reports 127 in that case).  `*stopped` is
+ * set when the child merely stopped rather than exited/appended. */
+int job_reap_pid(pid_t pid, int *stopped) {
+    int status;
+    pid_t w;
+    if (stopped) *stopped = 0;
+
+    sigchld_block();
+    do {
+        w = waitpid(pid, &status, WUNTRACED);
+    } while (w < 0 && errno == EINTR);
+    sigchld_unblock();
+
+    if (w == pid) {
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            job_remember_status(pid, (WIFSIGNALED(status)) ? 128 + WTERMSIG(status)
+                                                           : WEXITSTATUS(status));
+        }
+        /* Record the completion for the same reason the SIGCHLD path
+         * does: `$!` and a second `wait` both consult the job list, and
+         * in a non-interactive shell nothing else ever marks the entry
+         * done.  Without this, `wait $!` twice — or a loop that starts a
+         * job per iteration — kept seeing the *old* pid as the most
+         * recent job. */
+        Shell *sh2 = shell_get();
+        for (Job *j = sh2->jobs; j; j = j->next) {
+            for (int i = 0; i < j->npids; i++) {
+                if (j->pids[i] != pid) continue;
+                j->last_status = WIFSIGNALED(status) ? 128 + WTERMSIG(status)
+                              : WIFSTOPPED(status)  ? 128 + WSTOPSIG(status)
+                              : WEXITSTATUS(status);
+                if (WIFSTOPPED(status)) {
+                    /* a stopped job stays in the list and can be continued */
+                    if (stopped) *stopped = 1;
+                } else {
+                    j->pids[i] = 0;
+                    int all_done = 1;
+                    for (int k = 0; k < j->npids; k++)
+                        if (j->pids[k] != 0) { all_done = 0; break; }
+                    if (all_done) j->status = JOB_DONE;
+                }
+            }
+        }
+        if (WIFEXITED(status))   return WEXITSTATUS(status);
+        if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+        if (WIFSTOPPED(status)) { if (stopped) *stopped = 1; return 128 + WSTOPSIG(status); }
+        return 0;
+    }
+
+    /* ECHILD: the process is already gone — the SIGCHLD handler got there
+     * first, or an earlier `wait $pid` collected it.  The recorded status
+     * is the only answer left, and bash gives the same one every time this
+     * pid is asked about.  An unknown pid is an error (the caller reports
+     * 127), which is what makes `wait 999999` fail instead of silently
+     * succeeding. */
+    return job_recall_status(pid);
 }
 
 void job_remove(pid_t pgid) {
@@ -176,6 +263,12 @@ void job_notify(void) {
     Job *j = sh->jobs;
     int changed = 0;
 
+    /* Like the `[1] pid` line, the `[1]  Done` report belongs to job
+     * control: bash prints it only in an interactive shell.  Emitting it
+     * from a script put text on stderr that the reference shell never
+     * writes, and the very common `cmd & wait` idiom suddenly had noise. */
+    if (!sh->job_interactive) return;
+
     while (j) {
         Job *next = j->next;
         if (j->status == JOB_DONE) {
@@ -217,8 +310,13 @@ static int wait_for_pid(pid_t pid) {
     if (WIFEXITED(status))
         return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) {
-        fprintf(stderr, "besh: process %d terminated by signal %d\n",
-                pid, WTERMSIG(status));
+        /* bash reports a signal death only through the exit status; it is
+         * silent for the *foreground* case and leaves the "Terminated"
+         * wording to the job-control reporter.  SIGPIPE in particular is
+         * routine (`yes | head`, `producer | head`) and must never
+         * produce a diagnostic, so echoing one here made every pipeline
+         * with an early-closing reader noisy.  Propagate the status
+         * 128+signo and stay quiet. */
         return 128 + WTERMSIG(status);
     }
     if (WIFSTOPPED(status)) {
@@ -229,6 +327,55 @@ static int wait_for_pid(pid_t pid) {
 }
 
 /* ---- set up redirections ------------------------------------- */
+/* Feed a here-document to `wfd` from a forked writer, then close it.
+ *
+ * Writing the body directly would deadlock on any document larger than the
+ * pipe buffer (64 KiB by default): the single-threaded shell would block in
+ * write(2) with no reader on the other end yet, and the consumer — forked
+ * later, or scheduled later — never gets a chance to drain it.  A pipeline
+ * is the obvious case (`cat <<EOF | wc -l`), but `read x <<EOF` with a big
+ * body has the same shape.
+ *
+ * Forking a writer keeps the shell responsive: the child blocks in
+ * write(2) if it must, the parent finishes installing the descriptor, and
+ * the consumer drains the pipe from its own process.  The writer is
+ * detached (not waited for by the shell) because the consumer closes the
+ * read end when it is done, which gives the writer SIGPIPE/EPIPE and lets
+ * it exit on its own — the same lifecycle bash gives an internal writer.
+ *
+ * `content` is the already-expanded body; `quoted` is unused here (the
+ * caller expands or not before calling) and kept for clarity at the call
+ * site.  Returns 0 on success. */
+static int heredoc_feed(int wfd, const char *content) {
+    pid_t w = fork();
+    if (w < 0) {
+        /* fall back to an inline best-effort write rather than dropping
+         * the document entirely */
+        size_t clen = strlen(content), off = 0;
+        while (off < clen) {
+            ssize_t n = write(wfd, content + off, clen - off);
+            if (n < 0) { if (errno == EINTR) continue; break; }
+            off += (size_t)n;
+        }
+        return -1;
+    }
+    if (w == 0) {
+        /* writer child */
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
+        size_t clen = strlen(content), off = 0;
+        while (off < clen) {
+            ssize_t n = write(wfd, content + off, clen - off);
+            if (n < 0) { if (errno == EINTR) continue; break; }
+            off += (size_t)n;
+        }
+        close(wfd);
+        _exit(0);
+    }
+    return 0;
+}
+
 static int setup_redirections(Redir *redirs) {
     Shell *sh = shell_get();
     int psub_fd = -1;
@@ -306,10 +453,10 @@ static int setup_redirections(Redir *redirs) {
                     content = sh_strdup(r->heredoc);
                 else
                     content = expand_string(r->heredoc);
-                if (write(hpipe[1], content, strlen(content)) < 0) {
-                    /* the read end is gone (e.g. the consumer exited);
-                     * nothing useful to report here */
-                }
+                /* hand it off to a writer process: writing inline would
+                 * block here for any body bigger than the pipe buffer
+                 * (see heredoc_feed) */
+                heredoc_feed(hpipe[1], content);
                 free(content);
             }
             close(hpipe[1]);
@@ -644,6 +791,42 @@ int execute_command(ASTNode *node) {
                   if (fd < 0) { fprintf(stderr, "besh: %s: %s\n", rname, strerror(errno)); redir_failed = 1; }
                   else { dup2(fd, STDOUT_FILENO); close(fd); } }
                 break;
+            case REDIR_HEREDOC:
+            case REDIR_HEREDOC_DASH: {
+                /* A builtin can be fed a here-document too:
+                 *
+                 *     read line <<EOF
+                 *     hello
+                 *     EOF
+                 *
+                 * This case was previously missing, so the descriptor fell
+                 * through to `default:` and the body was silently dropped —
+                 * `read` then consumed the *shell's* stdin and set nothing.
+                 * The body is pre-expanded once (unless the delimiter was
+                 * quoted) and pushed through a pipe, exactly as the
+                 * external-command path in setup_redirections() does. */
+                if (saved_stdin < 0) saved_stdin = dup(STDIN_FILENO);
+                int hp[2];
+                if (pipe(hp) < 0) {
+                    fprintf(stderr, "besh: pipe: %s\n", strerror(errno));
+                    redir_failed = 1;
+                } else {
+                    if (r->heredoc) {
+                        char *content = r->quoted ? sh_strdup(r->heredoc)
+                                                  : expand_string(r->heredoc);
+                        /* a writer process, not an inline write: a body
+                         * larger than the pipe buffer would otherwise
+                         * block before the builtin ever reads (see
+                         * heredoc_feed) */
+                        heredoc_feed(hp[1], content);
+                        free(content);
+                    }
+                    close(hp[1]);
+                    dup2(hp[0], STDIN_FILENO);
+                    close(hp[0]);
+                }
+                break;
+            }
             case REDIR_DUPIN:
             case REDIR_DUPOUT:
                 if (r->src_fd == STDIN_FILENO) {
@@ -723,8 +906,11 @@ int execute_command(ASTNode *node) {
     }
 
     /* autocd (fish/zsh): typing a directory name changes into it */
+    char *autocd_path = (sh->opt_autocd && cmd_argv[0][0] != '/' &&
+                         strchr(cmd_argv[0], '/') == NULL)
+                            ? resolve_path(cmd_argv[0]) : NULL;
     if (sh->opt_autocd && cmd_argv[0][0] != '/' && strchr(cmd_argv[0], '/') == NULL &&
-        !resolve_path(cmd_argv[0])) {
+        !autocd_path) {
         struct stat st;
         if (stat(cmd_argv[0], &st) == 0 && S_ISDIR(st.st_mode)) {
             int r = cd_to(cmd_argv[0]);
@@ -743,6 +929,7 @@ int execute_command(ASTNode *node) {
             return r;
         }
     }
+    free(autocd_path);
 
     /* command_not_found_handler (zsh-style): when the command cannot be
      * resolved and a function of that name exists, call it with the whole
@@ -751,7 +938,8 @@ int execute_command(ASTNode *node) {
      * install the missing package, …); a non-zero return from the fork
      * path below is consequently never reached. */
     Function *cnf = exec_func_lookup("command_not_found_handler");
-    if (cnf && !resolve_path(cmd_argv[0])) {
+    char *cnf_path = cnf ? resolve_path(cmd_argv[0]) : NULL;
+    if (cnf && !cnf_path) {
         int r = call_shell_function(cnf, cmd_argc, cmd_argv);
         if (n_assign > 0) {
             for (int i2 = 0; i2 < n_assign; i2++) {
@@ -767,6 +955,7 @@ int execute_command(ASTNode *node) {
         free(expanded_argv);
         return r;
     }
+    free(cnf_path);
 
     /* external command — fork and exec */
     pid_t pid = fork();
@@ -867,6 +1056,12 @@ int execute_pipeline(ASTNode *pipeline) {
             signal(SIGINT, SIG_DFL);
             signal(SIGQUIT, SIG_DFL);
             signal(SIGTSTP, SIG_DFL);
+            /* Inherited handlers must not survive into the child.  A
+             * `producer | while ... done` stage that itself forks would
+             * otherwise have the *parent's* SIGCHLD handler reaping its
+             * own children behind its back, so `wait` returned ECHILD and
+             * the grandchild's status was lost. */
+            signal(SIGCHLD, SIG_DFL);
 
             /* stdin from previous pipe */
             if (i > 0) {
@@ -883,9 +1078,16 @@ int execute_pipeline(ASTNode *pipeline) {
                 close(pipes[j][1]);
             }
 
-            /* set up redirections */
+            /* set up redirections.  A stage whose redirection cannot be
+             * opened must fail on the spot: `echo hi | cat > nodir/f`
+             * used to run `cat` with the shell's own stdout still in
+             * place, so the text leaked to the terminal and the pipeline
+             * reported success.  bash reports 1 and prints nothing. */
             if (cmds[i]->type == NODE_COMMAND && cmds[i]->redirs) {
-                setup_redirections(cmds[i]->redirs);
+                if (setup_redirections(cmds[i]->redirs) < 0) {
+                    fflush(NULL);
+                    _exit(1);
+                }
             }
 
             /* execute the command */
@@ -1086,6 +1288,24 @@ static void pop_compound_redirs(int save_in, int save_out, int save_err) {
     if (save_err >= 0) { dup2(save_err, STDERR_FILENO); close(save_err); }
 }
 
+/* Return a copy of `s` in which every glob metacharacter is escaped, so
+ * fnmatch() compares the text literally.  Used for case alternatives that
+ * were written as a quoted word: bash builds those patterns from the raw
+ * word, and characters originating inside quotes are not special, so the
+ * resulting string still matches only itself. */
+static char *glob_escape_literal(const char *s) {
+    size_t n = strlen(s);
+    char *out = sh_malloc(n * 2 + 1);
+    size_t at = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (strchr("*?[]\\", s[i]))
+            out[at++] = '\\';
+        out[at++] = s[i];
+    }
+    out[at] = '\0';
+    return out;
+}
+
 static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
                                  int async) {
     Shell *sh = shell_get();
@@ -1098,11 +1318,25 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
      * instead would silently disable `set -e` for everything below. */
     int exempt_errexit = 0;
 
-    /* Reclaim any process substitution left over from the previous node.
-     * Doing it on entry rather than on exit covers every return path in
-     * this (large) function, and inside a loop body the substitution is
-     * released once per iteration instead of at the end of the loop. */
-    psub_reap();
+    /* NB: no psub_reap() here.  Reaping on *entry* looks tidy — it would
+     * cover every return path of this large function — but it deadlocks on
+     * an unbounded producer bound to a self-consuming consumer:
+     *
+     *     while read l; do echo "$l"; done < <(yes)
+     *
+     * The second iteration calls psub_reap() while the loop is still
+     * reading, and waitpid(yes, ..., 0) blocks forever: the child is
+     * blocked in write(2) because the loop has stopped draining the pipe
+     * (it is stuck waiting for the child to die).  Neither side can make
+     * progress.  bash reaps substitutions only after the command that owns
+     * them has finished, so we do the same — see execute_string() and
+     * shell_destroy(), which between them cover every exit. */
+
+    /* A signal with a `trap` action may have arrived while we were
+     * blocked in waitpid() or read().  Run it now, between commands,
+     * where the parser and the allocator are safe to use.  This is a
+     * cheap no-op when no trap is installed or nothing is pending. */
+    trap_run_pending();
 
     /* `return` unwinds the current function body / sourced file */
     if (sh->return_request) return sh->exit_status;
@@ -1211,10 +1445,17 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
             /* child — run in background */
             signal(SIGINT, SIG_DFL);
             signal(SIGQUIT, SIG_DFL);
+            signal(SIGCHLD, SIG_DFL);   /* never inherit the shell's reaper */
             if (sh->job_interactive) {
                 setpgid(0, 0);  /* new process group */
             }
-            _exit(execute_node_internal(node->left, NULL, NULL, 0));
+            /* _exit() skips stdio flushing, so a builtin that printed with
+             * printf (pwd, jobs, type, …) would lose its buffered output
+             * whenever stdout is a pipe or a file rather than a terminal.
+             * Flush explicitly, exactly as the pipeline child does. */
+            int bgret = execute_node_internal(node->left, NULL, NULL, 0);
+            fflush(NULL);
+            _exit(bgret);
         } else {
             /* parent */
             if (sh->job_interactive) {
@@ -1231,7 +1472,13 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
                 }
             }
             job_add(pid, pids, 1, cmdstr);
-            fprintf(stderr, "[%d] %d\n", sh->njob, pid);
+            /* The `[1] 12345` line is an *interactive* convenience: bash
+             * only prints it when job control is on, so a script's stderr
+             * stays clean.  Printing it unconditionally made every
+             * backgrounded command in a script emit noise the reference
+             * shell never produces. */
+            if (sh->job_interactive)
+                fprintf(stderr, "[%d] %d\n", sh->njob, pid);
             ret = 0;
         }
         break;
@@ -1258,8 +1505,13 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
         } else if (pid == 0) {
             signal(SIGINT, SIG_DFL);
             signal(SIGQUIT, SIG_DFL);
+            signal(SIGCHLD, SIG_DFL);
             if (sh->job_interactive) setpgid(0, 0);
-            _exit(execute_node_internal(node->left, NULL, NULL, 0));
+            /* as above: flush before _exit, or a builtin's buffered output
+             * is discarded when stdout is not a terminal */
+            int subret = execute_node_internal(node->left, NULL, NULL, 0);
+            fflush(NULL);
+            _exit(subret);
         } else {
             if (sh->job_interactive) {
                 setpgid(pid, pid);
@@ -1282,7 +1534,17 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
         break;
 
     case NODE_FUNCDEF:
-        /* function already registered at parse time */
+        /* Install the function *now*, not at parse time: the whole line is
+         * parsed before any of it runs, so a later `unset -f` on the same
+         * line would otherwise erase a definition that appears after it.
+         * func_register() overwrites a same-named entry in place, which is
+         * what makes redefinition take effect.  Ownership of the body
+         * moves to the function table, so clear it here to keep ast_free()
+         * from freeing it twice. */
+        if (node->func_name && node->func_body) {
+            func_register(node->func_name, node->func_body);
+            node->func_body = NULL;
+        }
         ret = 0;
         break;
 
@@ -1338,6 +1600,10 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
                 sh->continue_request = 0;
                 continue;
             }
+            /* `continue` above jumps past this, but the substitution the
+             * body created is already recorded; reclaim it here (and on
+             * the fall-through path) so the loop does not accumulate. */
+            psub_reap_nonblock();
         }
         for (int i = 0; i < nitems; i++) free(items[i]);
         free(items);
@@ -1365,24 +1631,61 @@ static int execute_node_internal(ASTNode *node, int *pipe_in, int *pipe_out,
                 sh->continue_request = 0;
                 continue;
             }
+            psub_reap_nonblock();
         }
         break;
     }
 
     case NODE_CASE: {
-        char *expanded = expand_string(node->case_word);
+        /* The case *word* is a plain value: `case "a*b"` compares against
+         * the three-character string a*b, so any quote-protection escape
+         * has to be resolved here.  expand_string() deliberately keeps
+         * the glob-escape backslashes for the pattern stage, which would
+         * leave the subject as the literal text `a\*b` and break every
+         * quoted word containing a glob character.  The no-split variant
+         * is the one that unescapes, and it is also what a case word
+         * wants: no word splitting, always exactly one word. */
+        char *expanded = expand_string_no_split(node->case_word);
         int matched = 0;
 
         for (int i = 0; i < node->case_count && !matched; i++) {
-            /* patterns are joined with '|' — split and fnmatch each */
+            /* patterns are joined with '|' — split and fnmatch each.
+             *
+             * Each alternative must be *expanded* before matching: a case
+             * pattern is a word like any other, so `case $x in $y)` and
+             * `case $x in "$y")` both compare against the value of y.
+             * The patterns were stored raw, and the unquoted form
+             * therefore never matched anything — a whole class of
+             * scripts silently took the `*)` branch. */
             char *pat_copy = sh_strdup(node->case_patterns[i]);
             char *save = NULL;
             char *token = strtok_r(pat_copy, "|", &save);
             while (token) {
-                if (fnmatch(token, expanded, 0) == 0) {
-                    matched = 1;
-                    break;
+                /* A case pattern is a word like any other, so it must be
+                 * expanded before matching: `case $x in $y)` and
+                 * `case $x in "$y")` both compare against the value of y.
+                 * The patterns were stored raw, so neither form ever
+                 * matched and the script silently fell through to `*)`.
+                 *
+                 * Quoting decides whether the *result* of that expansion is
+                 * a pattern or a literal.  Bash builds the pattern from the
+                 * word as written: characters that came out of a quoted
+                 * expansion are not special, so `x="a*b"; case "axxb" in
+                 * "$x")` compares against the three-character string "a*b"
+                 * and does *not* match "axxb", while the unquoted `$x`
+                 * stays a glob and does.  expand_string() drops the
+                 * quoting information, so the k-th entry of
+                 * case_pat_literal rescues it: when set, the expanded text
+                 * is escaped so every byte is matched literally. */
+                char *pat_exp = expand_string(token);
+                if (node->case_pat_literal[i]) {
+                    char *lit = glob_escape_literal(pat_exp);
+                    free(pat_exp);
+                    pat_exp = lit;
                 }
+                int rc_match = fnmatch(pat_exp, expanded, 0);
+                free(pat_exp);
+                if (rc_match == 0) { matched = 1; break; }
                 token = strtok_r(NULL, "|", &save);
             }
             free(pat_copy);
@@ -1489,6 +1792,58 @@ void psub_reap(void) {
     sh->npsub = 0;
 }
 
+/* Best-effort reclamation, safe to call from inside a loop body.
+ *
+ * With WNOHANG a substitution whose producer is still running — `yes`,
+ * a long `sleep`, a tail -f — is simply *skipped* rather than waited for.
+ * Only children that have already exited are waited on and removed from
+ * the queue; the rest stay registered for a later, blocking psub_reap().
+ *
+ * The descriptor half is what matters inside a loop: it is closed as soon
+ * as the command that consumed /dev/fd/N has returned, so a loop like
+ *
+ *     while [ $i -lt 40 ]; do diff <(echo $i) <(echo $i); i=$((i+1)); done
+ *
+ * does not climb to one leaked descriptor per iteration.  Closing it also
+ * lets a *subsequent* producer see EOF, but it does not disturb a pipe
+ * the current iteration's redirection is still reading from, because the
+ * caller that installed that redirection owns its own dup'd descriptor. */
+void psub_reap_nonblock(void) {
+    Shell *sh = shell_get();
+    if (sh->npsub == 0) return;
+
+    /* close every parent-side pipe end we still own */
+    for (int i = 0; i < sh->npsub; i++) {
+        if (sh->psub_fds[i] >= 0) {
+            close(sh->psub_fds[i]);
+            sh->psub_fds[i] = -1;
+        }
+    }
+
+    /* reap only the children that are already gone; compact in place */
+    int keep = 0;
+    for (int i = 0; i < sh->npsub; i++) {
+        int pid = sh->psub_pids[i];
+        if (pid > 0) {
+            int status;
+            pid_t r;
+            do {
+                r = waitpid(pid, &status, WNOHANG);
+            } while (r < 0 && errno == EINTR);
+            if (r <= 0) {
+                /* still running (or unattributable — keep it just in case) */
+                sh->psub_pids[keep] = pid;
+                sh->psub_fds[keep]  = sh->psub_fds[i];
+                keep++;
+                continue;
+            }
+        }
+        /* exited: drop it.  Its descriptor was closed above. */
+        sh->psub_fds[i] = -1;
+    }
+    sh->npsub = keep;
+}
+
 int execute_string(const char *cmd) {
     if (!cmd || !*cmd) return 0;
 
@@ -1497,6 +1852,20 @@ int execute_string(const char *cmd) {
 
     /* handle multi-line / compound commands */
     ASTNode *ast = parse_complete(l);
+
+    /* An unterminated quote is a syntax error, and bash refuses to run
+     * anything at all: it exits with status 2 and executes none of the
+     * input.  The lexer has already reported it; bail out here so the
+     * mangled command tree is never executed. */
+    if (l->syntax_error) {
+        ast_free(ast);
+        lexer_free(l);
+        sh->exit_status = 2;
+        if (!sh->job_interactive) {
+            sh->exit_request = 1;
+        }
+        return 2;
+    }
 
     if (!ast) {
         lexer_free(l);
